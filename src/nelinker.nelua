@@ -152,6 +152,8 @@ local function include_object(path: string, bytes: string)
       if s.alignment > PAGE or s.alignment & (s.alignment-1) ~= 0 then fail('unsupported section alignment') end
       if (s.flags == 2 or s.flags == 0x12 or s.flags == 0x32) and s.kind == 1 then
         s.group = 0 -- retain mergeable constants and strings in read-only storage
+      elseif s.flags == 2 and s.kind == 0x70000001 then
+        s.group = 0 -- SHT_X86_64_UNWIND uses the same relocated frame data as PROGBITS.
       elseif s.flags == 6 and s.kind == 1 then s.group = 1      -- executable code
       elseif s.flags == 3 and s.kind == 1 then s.group = 2      -- initialized writable data
       elseif s.flags == 3 and s.kind == 8 then s.group = 3      -- zero-filled writable data

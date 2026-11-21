@@ -244,6 +244,12 @@ def main():
     binary("standard-field",[start,absolute]);binary("tinycc-field",[start,"--tcc-relocs",absolute],17)
     binary("switch-back",["--tcc-relocs",start,"--elf-relocs",absolute])
     print("Standard RELA ignores the in-place field, and the scoped TinyCC mode honors it.")
+    cfi = ".text\n.globl work\nwork:\n.cfi_startproc\n mov $42,%eax\n ret\n.cfi_endproc"
+    for section_type in ("progbits", "unwind"):
+        obj = assemble(d / f"frame-{section_type}.o", f'.section .eh_frame,"a",@{section_type}\n' + cfi)
+        binary(f"frame-{section_type}", [start, obj])
+    assert (d / "frame-progbits").read_bytes() == (d / "frame-unwind").read_bytes()
+    print("GNU and LLVM x86-64 frame section types yield identical relocated bytes.")
     for relax in (False,True):
         obj=assemble(d/("got-%s.o"%relax),""".text
 .globl work
