@@ -19,7 +19,7 @@ def obj(name, asm):
     run("as", "--64", "-o", name, "-", input=asm.encode())
 
 
-def read_image(path):
+def read_image(path, expected_base=0x400000):
     image = path.read_bytes()
     assert image[:2] == b"MZ"
     header, = struct.unpack_from("<I", image, 0x3c)
@@ -30,6 +30,7 @@ def read_image(path):
     assert struct.unpack_from("<H", image, opt)[0] == 0x20b
     entry, = struct.unpack_from("<I", image, opt + 16)
     preferred, = struct.unpack_from("<Q", image, opt + 24)
+    assert preferred == expected_base
     va_align, raw_align = struct.unpack_from("<II", image, opt + 32)
     size, header_size = struct.unpack_from("<II", image, opt + 56)
     assert size % va_align == 0 and header_size % raw_align == 0
@@ -140,6 +141,16 @@ def check():
     assert len(first) < 65536
     run(LINKER, "--efi-app", "-o", output, "main.o", "helpers.a")
     assert first == output.read_bytes()
+
+    for option in (["--image-base", "4294967296"], ["--image-base=0x100000000"]):
+        run(LINKER, *option, "--efi-app", "-o", output, "main.o", "helpers.a")
+        assert read_image(output, 1 << 32)[0] == 42
+    for options in (["--image-base", "0x100000000"], ["--efi-app", "--image-base=3"],
+                    ["--efi-app", "--image-base=0x10000000000000000"], ["--efi-app", "--image-base=-1"],
+                    ["--efi-app", "--image-base="], ["--efi-app", "--image-base=0xg"]):
+        saved = output.read_bytes()
+        result = subprocess.run([LINKER, *options, "-o", output, "main.o"], capture_output=True)
+        assert b"base" in result.stderr and result.returncode and output.read_bytes() == saved
 
     obj("pic.o", ".text\n.globl custom\ncustom: mov $7, %eax\nret\n")
     run(LINKER, "-e", "custom", "--efi-app", "-o", output, "pic.o")

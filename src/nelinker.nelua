@@ -12,7 +12,7 @@ require 'stringbuilder'
 local ar = require 'archive'
 local pe = require 'pe'
 
-local BASE: integer <comptime> = 0x400000
+local image_base: integer = 0x400000
 local PAGE: integer <comptime> = 4096
 local LIMIT: integer <comptime> = 0x7fffffff
 local Section = @record{
@@ -264,7 +264,7 @@ local function symbol_offset(o: *Object, index: integer, sym: integer): (integer
   ## end
   if values[0]>(@uint64)(s.size) or values[1]>(@uint64)(s.size)-values[0] then fail('invalid ELF range') end
   local off=(@integer)(values[0])
-  return BASE+s.dest+off, s.group == 1 and off < s.size, s.group == 4 or s.group == 5
+  return image_base+s.dest+off, s.group == 1 and off < s.size, s.group == 4 or s.group == 5
 end
 
 local function define_symbols(o: *Object)
@@ -409,7 +409,7 @@ local function relocate(o: *Object, r: *Section)
       local dest = got_start + (o.got[index]-1)*8
       if efi and value~=0 then base_fixups:push(dest) end
       put(dest,(@uint64)(value),8)
-      value = BASE+dest
+      value = image_base+dest
     end
     local addend=row.addend
     if o.in_place_addends then
@@ -422,7 +422,7 @@ local function relocate(o: *Object, r: *Section)
     if kind == 1 then
       put(place,(@uint64)(value)+addend,8)
     else
-      if kind == 2 or kind == 4 or got_relative then value = value - (BASE+place) end
+      if kind == 2 or kind == 4 or got_relative then value = value - (image_base+place) end
       local low: integer = kind == 10 and 0 or -2147483648
       local high: integer = kind == 10 and 4294967295 or 2147483647
       local signed = (@int64)(addend)
@@ -434,7 +434,7 @@ end
 
 local function segment_header(h: integer, kind: integer, flags: integer, offset: integer, file_end: integer, mem_end: integer, alignment: integer)
   put(h,(@uint64)(kind),4); put(h+4,(@uint64)(flags),4); put(h+8,(@uint64)(offset),8)
-  put(h+16,(@uint64)(BASE+offset),8); put(h+24,(@uint64)(BASE+offset),8)
+  put(h+16,(@uint64)(image_base+offset),8); put(h+24,(@uint64)(image_base+offset),8)
   put(h+32,(@uint64)(file_end-offset),8); put(h+40,(@uint64)(mem_end-offset),8); put(h+48,(@uint64)(alignment),8)
 end
 
@@ -777,6 +777,7 @@ local usage='nelinker [--efi-app] -o OUTPUT [-e ENTRY] [-u SYMBOL] [-L DIR] OBJE
 if #arg==1 and arg[1]=='--help' then
   print(usage)
   print('  --efi-app                            write an x86-64 PE32+ EFI application (default entry efi_main)')
+  print('  --image-base ADDRESS                 preferred EFI load address, decimal or hex (default 0x400000)')
   print('  --archive -o OUTPUT [OBJECT ...]    create a deterministic GNU archive')
   print('    give each member a unique basename. Duplicate symbols retain input order.')
   print('  --whole-archive / --no-whole-archive   include every archive member / resume lazy selection')
@@ -785,7 +786,32 @@ if #arg==1 and arg[1]=='--help' then
   print('  -t, --trace                           print selected objects and archive members')
   os.exit(0)
 end
+-- Keep enough signed headroom for the largest supported image and both
+-- endpoints of a signed 32-bit relocation displacement.
+local function parse_base(value: string): integer
+  local radix=10
+  local first=1
+  if value:subview(1,2)=='0x' or value:subview(1,2)=='0X' then radix=16; first=3 end
+  if first>#value then fail('missing EFI image base') end
+  local result=0
+  local max: integer <comptime> = 0x7ffffffe00000000
+  for i=first,#value do
+    local c=value.data[i-1]
+    local digit: integer
+    if c>=48 and c<=57 then digit=c-48
+    elseif c>=65 and c<=70 then digit=c-55
+    elseif c>=97 and c<=102 then digit=c-87
+    else fail('invalid EFI image base') end
+    if digit>=radix then fail('invalid EFI image base') end
+    if result>(max-digit)//radix then fail('EFI image base exceeds supported range') end
+    result=result*radix+digit
+  end
+  if result & 0xffff ~= 0 then fail('EFI image base must be 64 KiB aligned') end
+  return result
+end
+
 local whole: boolean
+local explicit_base: boolean
 local tcc: boolean
 local positional: boolean
 local groups: sequence(integer)
@@ -796,6 +822,16 @@ while pos<=#arg do
     inputs:push({path=a,whole=whole,tcc=tcc})
   elseif a=='--' then positional=true
   elseif a=='--efi-app' then efi=true
+  elseif a=='--image-base' or a:subview(1,13)=='--image-base=' then
+    if explicit_base then fail('duplicate --image-base') end
+    local value=a:subview(14)
+    if a=='--image-base' then
+      pos=pos+1
+      if pos>#arg then fail('missing --image-base address') end
+      value=arg[pos]
+    end
+    image_base=parse_base(value)
+    explicit_base=true
   elseif a=='--tcc-relocs' then tcc=true
   elseif a=='--elf-relocs' then tcc=false
   elseif a=='--whole-archive' then whole=true
@@ -827,6 +863,7 @@ while pos<=#arg do
 end
 if #output==0 or #inputs==0 then fail('usage: '..usage) end
 if #groups>0 then fail('unmatched --start-group') end
+if explicit_base and not efi then fail('--image-base requires --efi-app') end
 if #entry==0 then entry=efi and 'efi_main' or '_start' end
 existing=stat(output,&old)==0
 ar.require_symbol(&symbols,entry)
@@ -845,7 +882,7 @@ if got_count > 0 then
   got_start = align_up(ro_end,8)
   if got_count > (LIMIT-got_start)//8 then fail('GOT exceeds supported image size') end
   ro_end=got_start+got_count*8
-  definitions['_GLOBAL_OFFSET_TABLE_']={addr=BASE+got_start}
+  definitions['_GLOBAL_OFFSET_TABLE_']={addr=image_base+got_start}
 end
 local rx = (efi or separate_ro) and align_up(ro_end,PAGE) or 0
 local rx_end = layout(1,(efi or separate_ro) and rx or headers_end)
@@ -858,7 +895,7 @@ if tls_align > 0 then
   rw_end = layout(4,tls_start)
   tls_mem_end = layout(5,rw_end)
   -- x86-64 local-exec TLS places its block immediately below the thread pointer.
-  thread_pointer = BASE+tls_start+align_up(tls_mem_end-tls_start,tls_align)
+  thread_pointer = image_base+tls_start+align_up(tls_mem_end-tls_start,tls_align)
 end
 local mem_end = layout(3,tls_mem_end)
 local has_rw = mem_end ~= rw
@@ -888,7 +925,7 @@ for i: usize=1,#forced do
   if not definitions:has(forced[i]) then fail('undefined symbol '..forced[i]) end
 end
 if efi then
-  local reason=pe.finish(&image,&base_fixups,BASE,definitions[entry].addr,ro_end,rx,rx_end,rw,rw_end,mem_end)
+  local reason=pe.finish(&image,&base_fixups,image_base,definitions[entry].addr,ro_end,rx,rx_end,rw,rw_end,mem_end)
   if #reason>0 then fail(reason) end
   save(output,true)
   os.exit(0)

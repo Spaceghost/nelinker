@@ -44,6 +44,9 @@ python3 tests/check_archives.py build/nelinker "$NECC_SYSROOT" build
 
 Use freestanding ELF64 objects with a Microsoft x64 ABI firmware entry point.
 The default entry symbol is `efi_main`. Use `-e NAME` for another symbol.
+The default preferred image base is `0x400000`. Set `--image-base ADDRESS`
+to a 64 KiB aligned address in decimal or hexadecimal. Firmware can relocate
+the image when that address is unavailable.
 The linker accepts the same ordered objects and static archives as the Linux
 mode. Each firmware entry or callback must use the calling convention expected
 by its caller.
