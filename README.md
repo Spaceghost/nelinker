@@ -1,6 +1,6 @@
 # nelinker
 
-nelinker is a static ELF linker written in Nelua for x86-64 Linux. It resolves symbols and relocations in ELF objects and Unix archives and writes fixed-address executables. It supports GNU and BSD archives, archive groups, static GOT entries, and local-exec TLS. PIE, shared libraries, thin archives, LTO, and custom linker scripts are outside its current scope.
+nelinker is a static ELF linker written in Nelua for x86-64 Linux. It resolves symbols and relocations in ELF objects and Unix archives and writes fixed-address Linux executables or relocatable PE32+ UEFI applications. It supports GNU and BSD archives, archive groups, static GOT entries, and local-exec TLS. PIE, shared libraries, thin archives, LTO, and custom linker scripts are outside its current scope.
 
 ## Build
 
@@ -38,3 +38,28 @@ Run the archive and relocation checks with Python 3, GNU binutils, and the same 
 ```sh
 python3 tests/check_archives.py build/nelinker "$NECC_SYSROOT" build
 ```
+
+
+## Link an x86-64 UEFI application
+
+Use freestanding ELF64 objects with a Microsoft x64 ABI firmware entry point.
+The default entry symbol is `efi_main`. Use `-e NAME` for another symbol.
+The linker accepts the same ordered objects and static archives as the Linux
+mode. Each firmware entry or callback must use the calling convention expected
+by its caller.
+
+```sh
+build/nelinker --efi-app -o BOOTX64.EFI loader.o support.a
+python3 tests/check_efi.py build/nelinker
+```
+
+The image separates executable code, read-only data, and writable data.
+RIP-relative references retain their displacements when firmware moves the
+image. Absolute 64-bit image pointers and populated GOT slots have PE DIR64
+base relocations. An undefined weak symbol used as an absolute pointer stays
+zero. For x86-64 code that embeds addresses, use RIP-relative instructions
+or full-width pointers. EFI mode rejects 32-bit absolute address fields,
+local-exec TLS, and PC-relative references to undefined weak symbols.
+
+The test validates the headers, maps the image at another address, applies
+its relocation table, and calls the relocated entry on x86-64 Linux.

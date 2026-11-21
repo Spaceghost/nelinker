@@ -10,6 +10,7 @@ require 'sequence'
 require 'string'
 require 'stringbuilder'
 local ar = require 'archive'
+local pe = require 'pe'
 
 local BASE: integer <comptime> = 0x400000
 local PAGE: integer <comptime> = 4096
@@ -110,6 +111,8 @@ local function parse_object(path: string, data: string): Object
   return o
 end
 
+local efi: boolean
+local base_fixups: sequence(integer)
 local trace: boolean
 local input_addends: boolean
 local tls_align: integer
@@ -154,6 +157,7 @@ local function include_object(path: string, bytes: string)
       elseif s.flags == 3 and s.kind == 8 then s.group = 3      -- zero-filled writable data
       elseif s.flags == 2 and s.kind == 7 then check_usage_note(&o,s)
       elseif s.flags == 0x403 and (s.kind == 1 or s.kind == 8) then
+        if efi then fail('TLS is unsupported in an EFI application') end
         s.group = s.kind == 1 and 4 or 5 -- .tdata / .tbss
         if tls_align == 0 then tls_align = 16 end -- x86-64 thread control block alignment
         if s.alignment > tls_align then tls_align = s.alignment end
@@ -371,6 +375,9 @@ local function relocate(o: *Object, r: *Section)
     if kind ~= 1 and kind ~= 2 and kind ~= 4 and kind ~= 10 and kind ~= 11 and kind ~= 23 and not got_relative then
       fail('unsupported x86-64 relocation ' .. tostring(kind))
     end
+    if efi and (kind == 10 or kind == 11 or kind == 23) then
+      fail('unsupported EFI x86-64 relocation ' .. tostring(kind) .. ' (use RIP-relative code or a 64-bit pointer)')
+    end
     local width = kind == 1 and 8 or 4
     if row.offset>(@uint64)(target.size) or target.size-(@integer)(row.offset)<width then fail('invalid ELF range') end
     local relative=(@integer)(row.offset)
@@ -384,6 +391,8 @@ local function relocate(o: *Object, r: *Section)
       $slot = tls and -(addr+1) or addr+1
     end
     local value = $slot-1
+    if efi and kind==1 and value~=0 then base_fixups:push(place) end
+    if efi and value==0 and (kind==2 or kind==4) then fail('PC-relative EFI relocation to an undefined weak symbol') end
     ## if ccinfo.is_little_endian or ccinfo.is_x86_64 then
     if kind==1 and not o.in_place_addends and $slot>0 then
       local field=(@uint64)(value)+row.addend
@@ -398,6 +407,7 @@ local function relocate(o: *Object, r: *Section)
       fail('ordinary relocation against TLS symbol')
     elseif got_relative then
       local dest = got_start + (o.got[index]-1)*8
+      if efi and value~=0 then base_fixups:push(dest) end
       put(dest,(@uint64)(value),8)
       value = BASE+dest
     end
@@ -476,7 +486,7 @@ local inputs: sequence(Input)
 local dirs: sequence(string)
 local forced: sequence(string)
 local output: string
-local entry = '_start'
+local entry: string
 local old: Stat
 local existing: boolean
 local function read(fd: cint, buf: pointer, size: csize): clong <cimport,cinclude '<unistd.h>'> end
@@ -763,9 +773,10 @@ end
 
 if create_archive_command() then os.exit(0) end
 
-local usage='nelinker -o OUTPUT [-e ENTRY] [-u SYMBOL] [-L DIR] OBJECT|ARCHIVE|-lNAME ...'
+local usage='nelinker [--efi-app] -o OUTPUT [-e ENTRY] [-u SYMBOL] [-L DIR] OBJECT|ARCHIVE|-lNAME ...'
 if #arg==1 and arg[1]=='--help' then
   print(usage)
+  print('  --efi-app                            write an x86-64 PE32+ EFI application (default entry efi_main)')
   print('  --archive -o OUTPUT [OBJECT ...]    create a deterministic GNU archive')
   print('    give each member a unique basename. Duplicate symbols retain input order.')
   print('  --whole-archive / --no-whole-archive   include every archive member / resume lazy selection')
@@ -784,6 +795,7 @@ while pos<=#arg do
   if positional or a:subview(1,1)~='-' then
     inputs:push({path=a,whole=whole,tcc=tcc})
   elseif a=='--' then positional=true
+  elseif a=='--efi-app' then efi=true
   elseif a=='--tcc-relocs' then tcc=true
   elseif a=='--elf-relocs' then tcc=false
   elseif a=='--whole-archive' then whole=true
@@ -815,6 +827,7 @@ while pos<=#arg do
 end
 if #output==0 or #inputs==0 then fail('usage: '..usage) end
 if #groups>0 then fail('unmatched --start-group') end
+if #entry==0 then entry=efi and 'efi_main' or '_start' end
 existing=stat(output,&old)==0
 ar.require_symbol(&symbols,entry)
 for i: usize=1,#forced do ar.require_symbol(&symbols,forced[i]) end
@@ -826,7 +839,7 @@ plan_got()
 -- readonly bytes are ELF headers, map them with text and omit an empty LOAD.
 local separate_ro=readonly_input or got_count>0
 local phnum=2+(separate_ro and 1 or 0)+(writable_input and 1 or 0)+(tls_align>0 and 1 or 0)
-local headers_end=64+phnum*56
+local headers_end=efi and PAGE or 64+phnum*56
 local ro_end=layout(0,headers_end)
 if got_count > 0 then
   got_start = align_up(ro_end,8)
@@ -834,8 +847,8 @@ if got_count > 0 then
   ro_end=got_start+got_count*8
   definitions['_GLOBAL_OFFSET_TABLE_']={addr=BASE+got_start}
 end
-local rx = separate_ro and align_up(ro_end,PAGE) or 0
-local rx_end = layout(1,separate_ro and rx or headers_end)
+local rx = (efi or separate_ro) and align_up(ro_end,PAGE) or 0
+local rx_end = layout(1,(efi or separate_ro) and rx or headers_end)
 local rw = align_up(rx_end,PAGE)
 local rw_end = layout(2,rw)
 local tls_start = rw_end
@@ -873,6 +886,12 @@ context = output
 if not definitions:has(entry) or not definitions[entry].entry_ok then fail('missing executable entry point '..entry) end
 for i: usize=1,#forced do
   if not definitions:has(forced[i]) then fail('undefined symbol '..forced[i]) end
+end
+if efi then
+  local reason=pe.finish(&image,&base_fixups,BASE,definitions[entry].addr,ro_end,rx,rx_end,rw,rw_end,mem_end)
+  if #reason>0 then fail(reason) end
+  save(output,true)
+  os.exit(0)
 end
 local ident = '\x7fELF\x02\x01\x01'
 memory.copy(&image[1],ident.data,#ident)
