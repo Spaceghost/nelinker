@@ -79,7 +79,15 @@ def check_archive_writer(d, linker, sdk, fixtures):
     start, _, work, middle, base, unused, simple = fixtures
     symbols = assemble(d / "symbols.o", ".data\n.weak weak_value\nweak_value: .long 1\n"
                        ".comm common_value,4,4\n.local private_value\nprivate_value: .long 2")
-    members = [unused, base, middle, work, symbols]
+    # GNU short names fit in the header, including the trailing slash.
+    # Whitespace uses the name table even when the basename is short.
+    short_space = d / "space name.o"
+    short_space.write_bytes(symbols.read_bytes())
+    exact = d / ("a" * 13 + ".o")
+    exact.write_bytes(symbols.read_bytes())
+    first_long = d / ("b" * 14 + ".o")
+    first_long.write_bytes(symbols.read_bytes())
+    members = [unused, base, middle, work, symbols, short_space, exact, first_long]
     archive = d / "created.a"
     create = [linker, "--archive", "-o", archive]
     env = {**os.environ, "PATH": "/nonexistent"}
@@ -92,6 +100,16 @@ def check_archive_writer(d, linker, sdk, fixtures):
     assert "private_value" not in index and "should_never_be_pulled" not in index
 
     first = archive.read_bytes()
+    headers = []
+    offset = 8
+    while offset < len(first):
+        header = first[offset:offset + 60]
+        size = int(header[48:58])
+        headers.append((header[:16].rstrip(), first[offset+60:offset+60+size]))
+        offset += 60 + size + size % 2
+    assert headers[0][0] == b"/"
+    assert headers[1] == (b"//", "".join(p.name + "/\n" for p in (middle, short_space, first_long)).encode())
+    assert headers[2][0] == b"unused.o/" and headers[-2][0] == exact.name.encode() + b"/"
     os.utime(work, (1000, 1000))
     invoke([*create, *members], env=env)
     assert archive.read_bytes() == first
@@ -114,6 +132,7 @@ def check_archive_writer(d, linker, sdk, fixtures):
     # A shorter rebuild must discard old members, including their symbols.
     invoke([*create, simple], env=env)
     assert invoke(["ar", "t", archive]).stdout.decode().splitlines() == [simple.name]
+    assert b"//              " not in archive.read_bytes()
     exe = d / "created-tcc"
     invoke([sdk / "tcc/tcc", "-B" + str(sdk / "tcc"), "-nostdlib", "-static",
             "-Wl,-e,_start", "-o", exe, start, archive])

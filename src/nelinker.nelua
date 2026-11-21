@@ -602,7 +602,7 @@ local function read_range(first: integer, last: integer)
   end
 end
 
-local ArchiveMember = @record{name: string, bytes: string}
+local ArchiveMember = @record{name: string, bytes: string, header_name: string}
 local ArchiveSymbol = @record{name: string, member: integer}
 
 local function archive_field(value: string, width: integer): string
@@ -629,11 +629,9 @@ end
 
 local function archive_header(name: string, size: integer): string
   if size < 0 or size > LIMIT then fail('archive member exceeds supported size') end
-  local result = archive_field(name,16) .. archive_field('0',12) ..
-    archive_field('0',6) .. archive_field('0',6) .. archive_field('644',8) ..
-    archive_field(tostring(size),10) .. string.char(96) .. '\n'
-  if #result ~= 60 then fail('invalid archive header') end
-  return result
+  -- Timestamp, UID, GID and mode are identical for all deterministic members.
+  local metadata = '0           0     0     644     '
+  return archive_field(name,16) .. metadata .. archive_field(tostring(size),10) .. string.char(96) .. '\n'
 end
 
 local function write_archive(members: *sequence(ArchiveMember), symbols: *sequence(ArchiveSymbol))
@@ -647,19 +645,23 @@ local function write_archive(members: *sequence(ArchiveMember), symbols: *sequen
     if #symbols[i].name > LIMIT-index_size-1 then fail('GNU archive index exceeds supported size') end
     index_size = index_size + (@integer)(#symbols[i].name) + 1
   end
-  local long_names: hashmap(string,integer)
   local long_table: sequence(byte)
   for i: usize = 1, #members do
     local name = members[i].name
-    if name:find('\n',1,true) ~= 0 or name:find('\0',1,true) ~= 0 then
-      fail('archive member name contains a reserved byte')
+    local needs_table = #name > 15
+    for j: usize = 1, #name do
+      local ch = name.data[j-1]
+      if ch == 0 or ch == 10 then fail('archive member name contains a reserved byte') end
+      if ch == 32 or (ch >= 9 and ch <= 13) then needs_table = true end
     end
-    if #name > 15 or name:find('%s') == 0 then
-      long_names[name] = (@integer)(#long_table)
+    if needs_table then
+      members[i].header_name = '/' .. tostring(#long_table)
       for j: usize = 1, #name do long_table:push(name.data[j-1]) end
       long_table:push('/'_b)
       long_table:push('\n'_b)
       if #long_table > LIMIT then fail('GNU archive name table exceeds supported size') end
+    else
+      members[i].header_name = name .. '/'
     end
   end
 
@@ -690,18 +692,10 @@ local function write_archive(members: *sequence(ArchiveMember), symbols: *sequen
   end
   for i: usize = 1, #members do
     local member = &members[i]
-    local name: string
-    local long_offset = long_names[member.name]
-    if long_names:has(member.name) then
-      name = '/' .. tostring(long_offset)
-    else
-      name = member.name .. '/'
-    end
-    append_archive(archive_header(name,(@integer)(#member.bytes)))
+    append_archive(archive_header(member.header_name,(@integer)(#member.bytes)))
     append_archive(member.bytes)
     if #member.bytes%2 ~= 0 then append_archive('\n') end
   end
-  long_names:destroy()
   long_table:destroy()
   offsets:destroy()
 end
