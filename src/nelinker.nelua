@@ -767,6 +767,7 @@ local usage='nelinker -o OUTPUT [-e ENTRY] [-u SYMBOL] [-L DIR] OBJECT|ARCHIVE|-
 if #arg==1 and arg[1]=='--help' then
   print(usage)
   print('  --archive -o OUTPUT [OBJECT ...]    create a deterministic GNU archive')
+  print('    give each member a unique basename. Duplicate symbols retain input order.')
   print('  --whole-archive / --no-whole-archive   include every archive member / resume lazy selection')
   print('  --start-group / --end-group           rescan grouped archives for cyclic dependencies')
   print('  --tcc-relocs / --elf-relocs           TinyCC in-place addends / standard ELF RELA (default)')

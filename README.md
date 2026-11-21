@@ -29,7 +29,9 @@ Archive mode writes a fresh GNU-format library with a symbol index. Pass every
 object in the desired member order. Repeating the command with the same object
 bytes and member names produces identical archive bytes, even if the input
 timestamps change. Give each member a unique basename. Long names and spaces
-are supported. An empty member list creates an empty archive.
+are supported. An empty member list creates an empty archive. The writer uses
+a 32-bit GNU symbol index and supports archives smaller than 2 GiB. Input
+objects must use ordinary ELF section indexes.
 
 Run the archive and relocation checks with Python 3, GNU binutils, and the same SDK.
 
