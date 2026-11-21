@@ -12,6 +12,23 @@ mkdir -p build
 (cd src && NECC_NELINKER= necc --release nelinker.nelua -o ../build/nelinker)
 ```
 
+The native C backend is also supported for building from this standalone
+repository. Run the public `necc` driver from `src` so its module path stays
+inside this checkout; the output uses a separate name from the seed build:
+
+```sh
+mkdir -p build
+(cd src && NECC_NELINKER= necc --native --release -L . nelinker.nelua -o ../build/nelinker-native)
+```
+
+Run the archive and firmware checks against the native output. The archive
+check also uses the staged SDK to verify real Nelibc archive extraction:
+
+```sh
+python3 tests/check_archives.py build/nelinker-native "$NECC_SYSROOT" build
+python3 tests/check_efi.py build/nelinker-native
+```
+
 ## Create and link an archive
 
 Assemble the two example inputs, then use nelinker to create the static library and link its caller. The link trace should include `build/libanswer.a(answer.o)`. The program exits with status 42.
