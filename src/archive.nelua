@@ -1,0 +1,338 @@
+-- Regular Unix archives. Member payloads and symbol names borrow the mapped input.
+require 'hashmap'
+require 'io'
+require 'os'
+require 'sequence'
+require 'string'
+
+local ar = @record{}
+local Member = @record{name: string, header: integer, start: integer, size: integer, long_ref: boolean, loaded: boolean, inline_name: boolean}
+local Entry = @record{name: string, member: integer, next: integer}
+global ar.File = @record{
+  path: string, bytes: string, strings: string, index: string, width: integer,
+  members: sequence(Member), entries: sequence(Entry), first: hashmap(string,integer),
+  scanned: boolean, indexed: boolean, considered: usize, exhausted: boolean
+}
+global ar.State = @record{status: hashmap(string,integer), requests: sequence(string), outstanding: integer, sole_request: string}
+-- 0 = unseen, 1 = strong undefined, 2 = defined (including a weak definition).
+function ar.require_symbol(s: *ar.State, name: string)
+  local status=&s.status[name]
+  if $status==0 then
+    $status=1
+    s.requests:push(name)
+    s.sole_request = s.outstanding == 0 and name or ''
+    s.outstanding = s.outstanding+1
+  end
+end
+function ar.provide(s: *ar.State, name: string)
+  local status=&s.status[name]
+  if $status==1 then
+    s.outstanding = s.outstanding-1
+    if s.sole_request == name then s.sole_request = '' end
+  end
+  $status=2
+end
+
+local function invalid(path: string, why: string): void <noreturn>
+  io.stderr:write('nelinker: ' .. path .. ': ' .. why .. '\n')
+  os.exit(1)
+end
+
+local function decimal(path: string, field: string, limit: integer): integer
+  local n: integer = 0
+  local max_prefix, max_last = limit // 10, limit % 10
+  local digits = false
+  local trailing = false
+  for i: usize = 0, < #field do
+    local c = field.data[i]
+    if c == 32 then
+      if digits then trailing = true end
+    elseif c >= 48 and c <= 57 and not trailing then
+      local d: integer = c-48
+      if n > max_prefix or (n == max_prefix and d > max_last) then
+        invalid(path,'archive decimal field exceeds bounds')
+      end
+      n = n*10+d
+      digits = true
+    else
+      invalid(path,'invalid archive decimal field')
+    end
+  end
+  if not digits then invalid(path,'empty archive decimal field') end
+  return n
+end
+
+local function slice(s: string, start: integer, size: integer): string
+  if size==0 then return '' end
+  return (@string){data=(@*[0]byte)(&s.data[start]),size=(@usize)(size)}
+end
+
+local function bsd_index(name: string): boolean
+  return name == '__.SYMDEF' or name == '__.SYMDEF SORTED' or
+         name == '__.SYMDEF_64' or name == '__.SYMDEF_64 SORTED'
+end
+
+function ar.open(path: string, bytes: string): ar.File
+  local a: ar.File = {path=path,bytes=bytes}
+  local length = (@integer)(#bytes)
+  local pos: integer = 8
+  local long_names=false
+  while pos < length do
+    if length-pos < 60 or bytes.data[pos+58] ~= 96 or bytes.data[pos+59] ~= 10 then
+      invalid(path,'invalid archive member header')
+    end
+    local start = pos+60
+    local size = decimal(path,slice(bytes,pos+48,10),length-start)
+    local nextpos = start+size
+    if size % 2 ~= 0 then
+      -- GNU ar uses a newline here and the distro's TinyCC uses a NUL.
+      if nextpos >= length then invalid(path,'missing archive member padding') end
+      nextpos = nextpos+1
+    end
+    -- Ordinary short names cannot be metadata or empty. Keep the fixed-width
+    -- field until this member is selected and a diagnostic path is needed.
+    local lead=bytes.data[pos]
+    if (lead>='a'_b and lead<='z'_b) or (lead>='A'_b and lead<='Z'_b) or (lead>='0'_b and lead<='9'_b) then
+      a.members:push({name=slice(bytes,pos,16),header=pos,start=start,size=size,inline_name=true})
+      pos=nextpos
+      continue
+    end
+    local last = pos+16
+    while last > pos and bytes.data[last-1] == 32 do last=last-1 end
+    local name = slice(bytes,pos,last-pos)
+    if name == '/' or name == '/SYM64/' then
+      if a.width ~= 0 then invalid(path,'duplicate GNU archive index') end
+      a.width = name == '/' and 4 or 8
+      a.index = slice(bytes,start,size)
+    elseif name == '//' then
+      a.strings = slice(bytes,start,size)
+    else
+      if #name==0 then invalid(path,'empty archive member name') end
+      local long_ref = name.data[0]=='/'_b
+      if #name>=3 and name.data[0]=='#'_b and name.data[1]=='1'_b and name.data[2]=='/'_b then
+        local n = decimal(path,name:subview(4),size)
+        local used = n
+        while used > 0 and bytes.data[start+used-1] == 0 do used=used-1 end
+        name = slice(bytes,start,used)
+        start=start+n; size=size-n
+      elseif name.data[#name-1]=='/'_b then
+        name=slice(name,0,(@integer)(#name)-1)
+      end
+      if #name == 0 then invalid(path,'empty archive member name') end
+      if name.data[0]~='_'_b or not bsd_index(name) then
+        if long_ref then long_names=true end
+        a.members:push({name=name,header=pos,start=start,size=size,long_ref=long_ref})
+      end
+    end
+    pos=nextpos
+  end
+  -- Most archives use only the inline names already decoded above.
+  if not long_names then return a end
+  -- GNU member names reference offsets into the archive's long-name table.
+  for i: usize = 1, #a.members do
+    local m = &a.members[i]
+    if m.long_ref then
+      local n = (@integer)(#a.strings)
+      if n == 0 then invalid(path,'missing archive long-name table') end
+      local start = decimal(path,m.name:subview(2),n-1)
+      if start > 0 and a.strings.data[start-1] ~= 10 then invalid(path,'invalid archive name offset') end
+      local stop = start
+      while stop < n and a.strings.data[stop] ~= 10 do stop=stop+1 end
+      if stop == n or stop <= start or a.strings.data[stop-1] ~= 47 then invalid(path,'invalid GNU archive long name') end
+      m.name = slice(a.strings,start,stop-start-1)
+    end
+  end
+  return a
+end
+
+local function big_word(a: *ar.File, off: integer, limit: integer): integer
+  local p=(@*[0]byte)(&a.index.data[off])
+  local v=((@uint64)(p[0])<<24) | ((@uint64)(p[1])<<16) | ((@uint64)(p[2])<<8) | p[3]
+  if a.width==8 then
+    v=(v<<32) | ((@uint64)(p[4])<<24) | ((@uint64)(p[5])<<16) | ((@uint64)(p[6])<<8) | p[7]
+  end
+  if v > (@uint64)(limit) then invalid(a.path,'GNU archive index value exceeds bounds') end
+  return (@integer)(v)
+end
+
+local function member_path(a: *ar.File, m: *Member): string
+  local name=m.name
+  if m.inline_name then
+    local last=(@integer)(#name)
+    while last>0 and name.data[last-1]==32 do last=last-1 end
+    if last>0 and name.data[last-1]=='/'_b then last=last-1 end
+    name=slice(name,0,last)
+  end
+  return a.path .. '(' .. name .. ')'
+end
+
+local function include_member(a: *ar.File, index: integer, include: function(string,string))
+  local m=&a.members[index]
+  if m.loaded then return end
+  m.loaded=true
+  include(member_path(a,m),slice(a.bytes,m.start,m.size))
+end
+
+-- GNU ar emits the offset of the member header for each symbol. Consecutive
+-- symbols commonly share a member, even though the index may be unsorted.
+local function find_member(a: *ar.File, offset: integer): integer
+  local lo: integer = 1
+  local hi = (@integer)(#a.members)
+  while lo <= hi do
+    local mid = lo + (hi-lo)//2
+    local header = a.members[mid].header
+    if offset == header then return mid end
+    if offset < header then hi=mid-1 else lo=mid+1 end
+  end
+  invalid(a.path,'archive index points outside a member header')
+  return 0
+end
+
+local function visit_index(a: *ar.File, s: *ar.State, store: boolean, include: function(string,string))
+  local length = (@integer)(#a.index)
+  if length < a.width then invalid(a.path,'truncated GNU archive index') end
+  local n = big_word(a,0,(length-a.width)//a.width)
+  local pos = (n+1)*a.width
+  local previous: integer = -1
+  local member: integer
+  if store then a.entries:reserve((@usize)(n)) end
+  for i = 1,n do
+    local offset = big_word(a,i*a.width,(@integer)(#a.bytes))
+    if offset ~= previous then
+      if member < (@integer)(#a.members) and a.members[member+1].header == offset then
+        member = member+1
+      else
+        member = find_member(a,offset)
+      end
+      previous = offset
+    end
+    local start = pos
+    while pos < length and a.index.data[pos] ~= 0 do pos=pos+1 end
+    if pos == length or pos == start then invalid(a.path,'invalid symbol name in archive index') end
+    local name = slice(a.index,start,pos-start)
+    if store then
+      a.entries:push({name=name,member=member})
+    elseif s.outstanding > 0 then
+      local needed = #s.sole_request > 0 and name == s.sole_request
+      if needed or (#s.sole_request == 0 and s.status[name] == 1) then include_member(a,member,include) end
+    end
+    pos=pos+1
+  end
+end
+
+local function read_exports(a: *ar.File, exports: function(string,string,*sequence(string)))
+  -- BSD and unindexed archives use the ELF export table of each member.
+  local names: sequence(string)
+  for i: usize = 1,#a.members do
+    local m = &a.members[i]
+    names:clear()
+    exports(member_path(a,m),slice(a.bytes,m.start,m.size),&names)
+    for j: usize = 1,#names do a.entries:push({name=names[j],member=(@integer)(i)}) end
+  end
+  names:destroy()
+end
+
+local function build_index(a: *ar.File)
+  -- Bound the (pass, ordinal) key below signed 64-bit range.
+  if #a.entries > 0x7fffffff then invalid(a.path,'too many indexed archive symbols') end
+  -- Preserve index order even when different members advertise the same name.
+  for i=(@integer)(#a.entries),1,-1 do
+    local e=&a.entries[i]
+    e.next=a.first[e.name]
+    a.first[e.name]=i
+  end
+  a.indexed=true
+end
+
+-- Priority is (archive scan pass, symbol-table order). This reproduces an
+-- ordered archive scan without revisiting unrelated entries for every new
+-- dependency, even when a long chain is stored in reverse dependency order.
+local function enqueue(q: *sequence(integer), key: integer)
+  q:push(key)
+  local i=(@integer)(#($q))
+  while i>1 do
+    local parent=i//2
+    if ($q)[parent]<=key then break end
+    ($q)[i]=($q)[parent]; i=parent
+  end
+  ($q)[i]=key
+end
+local function dequeue(q: *sequence(integer)): integer
+  local first=($q)[1]
+  local last=q:pop()
+  local n=(@integer)(#($q))
+  if n>0 then
+    local i: integer=1
+    while i<=n//2 do
+      local j=i*2
+      if j<n and ($q)[j+1]<($q)[j] then j=j+1 end
+      if last<=($q)[j] then break end
+      ($q)[i]=($q)[j]; i=j
+    end
+    ($q)[i]=last
+  end
+  return first
+end
+
+function ar.search(a: *ar.File, s: *ar.State, whole: boolean,
+                   include: function(string,string), exports: function(string,string,*sequence(string)))
+  if a.exhausted then return end
+  if whole then
+    for i=1,(@integer)(#a.members) do include_member(a,i,include) end
+    a.exhausted=true
+    return
+  end
+  if a.considered == #s.requests then return end
+  if s.outstanding == 0 then a.considered=#s.requests; return end
+  if not a.scanned then
+    a.scanned=true
+    a.considered=#s.requests
+    -- Stream the first pass. A reverse dependency or later group rescan is
+    -- the point at which retaining a reverse index pays for itself.
+    if a.width ~= 0 then
+      visit_index(a,s,false,include)
+    else
+      read_exports(a,exports)
+      for i: usize = 1,#a.entries do
+        local e = &a.entries[i]
+        if s.status[e.name] == 1 then include_member(a,e.member,include) end
+      end
+    end
+    if s.outstanding == 0 then a.considered=#s.requests; return end
+    if a.considered == #s.requests then return end
+  end
+  if not a.indexed then
+    if a.width ~= 0 then visit_index(a,s,true,include) end
+    build_index(a)
+  end
+  local n=(@integer)(#a.entries)
+  if n==0 then a.exhausted=true; return end
+  local q: sequence(integer)
+  local cursor: integer=-1
+  while true do
+    while a.considered < #s.requests do
+      a.considered=a.considered+1
+      local name=s.requests[a.considered]
+      if s.status[name]~=1 then continue end
+      local entry=a.first[name]
+      while entry~=0 do
+        if not a.members[a.entries[entry].member].loaded then
+          local key=entry-1
+          if cursor>=0 then
+            key=key+(cursor//n)*n
+            if key<=cursor then key=key+n end
+          end
+          enqueue(&q,key)
+        end
+        entry=a.entries[entry].next
+      end
+    end
+    if #q==0 then break end
+    cursor=dequeue(&q)
+    local e=&a.entries[cursor%n+1]
+    if s.status[e.name]==1 then include_member(a,e.member,include) end
+  end
+  q:destroy()
+end
+return ar
+

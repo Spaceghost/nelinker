@@ -1,0 +1,723 @@
+-- Static ELF64 linker for freestanding x86-64 object files.
+-- Inputs, names, and output storage live for the duration of this one link.
+## pragmas.nogc = true
+require 'arg'
+require 'hashmap'
+require 'io'
+require 'memory'
+require 'os'
+require 'sequence'
+require 'string'
+require 'stringbuilder'
+local ar = require 'archive'
+
+local BASE: integer <comptime> = 0x400000
+local PAGE: integer <comptime> = 4096
+local LIMIT: integer <comptime> = 0x7fffffff
+local Section = @record{
+  kind: integer, flags: uint64, offset: integer, size: integer,
+  link: integer, info: integer, alignment: integer, entsize: integer,
+  group: integer, dest: integer
+}
+-- The target is always little-endian x86-64. Copy each validated record
+-- into aligned storage once. Archive members can start between aligned words.
+local ElfSection = @record{name: uint32, kind: uint32, flags: uint64, addr: uint64, offset: uint64,
+                           size: uint64, link: uint32, info: uint32, alignment: uint64, entsize: uint64}
+local ElfRelocation = @record{offset: uint64, info: uint64, addend: uint64}
+## static_assert(ElfSection.value.size == 64 and ElfRelocation.value.size == 24, 'unexpected ELF record layout')
+local Object = @record{path: string, data: string, sections: sequence(Section), symtab: integer, strings: string, in_place_addends: boolean, addresses: sequence(integer), got: hashmap(integer,integer)}
+local Definition = @record{addr: integer, entry_ok: boolean, weak: boolean, tls: boolean}
+local objects: sequence(Object)
+local definitions: hashmap(string, Definition)
+local image: sequence(byte)
+local context = ''
+
+local function fail(message: string): void <noreturn>
+  io.stderr:write('nelinker: ' .. (#context > 0 and context .. ': ' or '') .. message .. '\n')
+  os.exit(1)
+end
+
+-- File and section offsets are zero-based throughout.
+local function range(size: integer, off: integer, count: integer)
+  if off < 0 or count < 0 or off > size or count > size - off then fail('invalid ELF range') end
+end
+
+local function word(s: string, off: integer, width: integer): uint64
+  range((@integer)(#s), off, width)
+  local v: uint64 = 0
+  ## if ccinfo.is_little_endian or ccinfo.is_x86_64 then
+  -- The checked field can be unaligned. Copying into an integer handles that
+  -- and zero-extends fields narrower than the destination.
+  memory.copy(&v,&s.data[off],width)
+  ## else
+  for i = width - 1, 0, -1 do v = (v << 8) | s.data[off+i] end
+  ## end
+  return v
+end
+
+local function number(s: string, off: integer, width: integer): integer
+  local v = word(s, off, width)
+  if v > LIMIT then fail('ELF field exceeds supported range') end
+  return (@integer)(v)
+end
+
+local function section(o: *Object, index: integer): *Section
+  if index < 0 or index >= (@integer)(#o.sections) then fail('invalid section index') end
+  return &o.sections[index+1]
+end
+
+local function parse_object(path: string, data: string): Object
+  context = path
+  if #data < 64 or data:subview(1,7) ~= '\x7fELF\x02\x01\x01' or
+      number(data,16,2) ~= 1 or number(data,18,2) ~= 62 or word(data,20,4) ~= 1 then
+    fail('expected a little-endian x86-64 ELF relocatable object')
+  end
+  local start = number(data,40,8)
+  local count = number(data,60,2)
+  if number(data,52,2) ~= 64 or number(data,58,2) ~= 64 or count == 0 then fail('unsupported ELF section table') end
+  range((@integer)(#data),start,count*64)
+  local o: Object = {path=path, data=data, symtab=-1}
+  o.sections:reserve((@usize)(count))
+  for n = 0, count-1 do
+    local h = start+n*64
+    local row: ElfSection <noinit>
+    ## if ccinfo.is_little_endian or ccinfo.is_x86_64 then
+    memory.copy(&row,&data.data[h],#ElfSection)
+    ## else
+    row.kind=(@uint32)(word(data,h+4,4)); row.flags=word(data,h+8,8)
+    row.offset=word(data,h+24,8); row.size=word(data,h+32,8)
+    row.link=(@uint32)(word(data,h+40,4)); row.info=(@uint32)(word(data,h+44,4))
+    row.alignment=word(data,h+48,8); row.entsize=word(data,h+56,8)
+    ## end
+    if (row.kind | row.offset | row.size | row.link | row.info | row.alignment | row.entsize)>LIMIT then
+      fail('ELF field exceeds supported range')
+    end
+    local s: Section = {kind=(@integer)(row.kind),flags=row.flags,offset=(@integer)(row.offset),
+      size=(@integer)(row.size),link=(@integer)(row.link),info=(@integer)(row.info),
+      alignment=(@integer)(row.alignment),entsize=(@integer)(row.entsize),group=-1}
+    if s.kind ~= 8 then range((@integer)(#data), s.offset, s.size) end
+    if s.kind == 2 then
+      if o.symtab >= 0 or s.entsize ~= 24 or s.size % 24 ~= 0 then fail('unsupported ELF symbol table') end
+      o.symtab = n
+    end
+    o.sections:push(s)
+  end
+  if o.symtab>=0 then
+    local strings=section(&o,section(&o,o.symtab).link)
+    if strings.kind~=3 then fail('invalid symbol string table') end
+    o.strings=data:subview(strings.offset+1,strings.offset+strings.size)
+  end
+  return o
+end
+
+local trace: boolean
+local input_addends: boolean
+local tls_align: integer
+local thread_pointer: integer
+local got_start: integer
+local got_count: integer
+local readonly_input: boolean
+local writable_input: boolean
+local definition_hint: integer
+-- Recent GNU as versions emit advisory x86 ISA/feature usage notes by
+-- default. This stripped output omits those optional descriptions. Reject
+-- any property with runtime requirements until the linker can merge it.
+local function check_usage_note(o: *Object, s: *Section)
+  local off = s.offset
+  if s.size < 16 or word(o.data,off,4) ~= 4 or word(o.data,off+4,4) ~= s.size-16 or
+      word(o.data,off+8,4) ~= 5 or word(o.data,off+12,4) ~= 0x00554e47 or
+      (s.size-16) % 16 ~= 0 then fail('unsupported allocated ELF note') end
+  for pos=off+16,<off+s.size,16 do
+    local property=word(o.data,pos,4)
+    if (property ~= 0xc0010001 and property ~= 0xc0010002) or word(o.data,pos+4,4) ~= 4 then
+      fail('unsupported GNU object property')
+    end
+  end
+end
+local function include_object(path: string, bytes: string)
+  local o = parse_object(path,bytes)
+  o.in_place_addends = input_addends
+  if o.symtab>=0 then
+    local t=section(&o,o.symtab)
+    local globals=t.size//24-t.info
+    if globals>definition_hint then definition_hint=globals end
+  end
+  for i: usize = 1, #o.sections do
+    local s = &o.sections[i]
+    if s.flags & 2 ~= 0 and s.size > 0 then
+      if s.alignment == 0 then s.alignment = 1 end
+      if s.alignment > PAGE or s.alignment & (s.alignment-1) ~= 0 then fail('unsupported section alignment') end
+      if (s.flags == 2 or s.flags == 0x12 or s.flags == 0x32) and s.kind == 1 then
+        s.group = 0 -- retain mergeable constants and strings in read-only storage
+      elseif s.flags == 6 and s.kind == 1 then s.group = 1      -- executable code
+      elseif s.flags == 3 and s.kind == 1 then s.group = 2      -- initialized writable data
+      elseif s.flags == 3 and s.kind == 8 then s.group = 3      -- zero-filled writable data
+      elseif s.flags == 2 and s.kind == 7 then check_usage_note(&o,s)
+      elseif s.flags == 0x403 and (s.kind == 1 or s.kind == 8) then
+        s.group = s.kind == 1 and 4 or 5 -- .tdata / .tbss
+        if tls_align == 0 then tls_align = 16 end -- x86-64 thread control block alignment
+        if s.alignment > tls_align then tls_align = s.alignment end
+      else fail('unsupported allocated section type or flags') end
+      if s.group==0 then readonly_input=true elseif s.group>=2 then writable_input=true end
+    end
+  end
+  objects:push(o)
+  if trace then print(path) end
+end
+
+local function align_up(n: integer, alignment: integer): integer
+  return (n + alignment-1) & ~(alignment-1)
+end
+
+local function layout(group: integer, cursor: integer): integer
+  for i: usize = 1, #objects do
+    local o = &objects[i]
+    for j: usize = 1, #o.sections do
+      local s = &o.sections[j]
+      if s.group == group then
+        cursor = align_up(cursor, s.alignment)
+        if cursor > LIMIT - s.size then fail('image exceeds supported range') end
+        s.dest = cursor
+        cursor = cursor + s.size
+      end
+    end
+  end
+  return cursor
+end
+
+local function name_at(o: *Object, relative: uint32): string
+  if relative>=#o.strings then fail('invalid ELF range') end
+  local first=&o.strings.data[relative]
+  local last=memory.scan(first,0,#o.strings-relative)
+  if last==nilptr then fail('unterminated symbol name') end
+  return (@string){data=(@*[0]byte)(first),size=(@usize)(last)-(@usize)(first)}
+end
+
+local function symname(o: *Object, sym: integer): string
+  local relative: uint32 <noinit>
+  ## if ccinfo.is_little_endian or ccinfo.is_x86_64 then
+  memory.copy(&relative,&o.data.data[sym],4)
+  ## else
+  relative=(@uint32)(word(o.data,sym,4))
+  ## end
+  return name_at(o,relative)
+end
+
+local function symsection(o: *Object, sym: integer): integer <inline>
+  return o.data.data[sym+6] | ((@integer)(o.data.data[sym+7]) << 8)
+end
+
+local symbols: ar.State
+local tracked: usize
+local function track_objects()
+  while tracked < #objects do
+    tracked = tracked+1
+    local o = &objects[tracked]
+    if o.symtab < 0 then continue end
+    context = o.path
+    local t = section(o,o.symtab)
+    for sym = t.offset + 24, < t.offset+t.size, 24 do
+      local bind = o.data.data[sym+4] >> 4
+      if bind ~= 1 and bind ~= 2 then continue end
+      local defined = symsection(o,sym) ~= 0
+      if not defined and bind == 2 then continue end
+      local name = symname(o,sym)
+      if defined then ar.provide(&symbols,name) else ar.require_symbol(&symbols,name) end
+    end
+  end
+end
+
+local function include_member(path: string, bytes: string)
+  include_object(path,bytes)
+  track_objects()
+end
+
+local function member_exports(path: string, bytes: string, result: *sequence(string))
+  -- A regular archive can contain foreign objects or non-object metadata.
+  if #bytes < 64 or bytes:subview(1,7) ~= '\x7fELF\x02\x01\x01'
+      or word(bytes,16,2) ~= 1 or word(bytes,18,2) ~= 62 then return end
+  local o = parse_object(path,bytes)
+  if o.symtab >= 0 then
+    local t = section(&o,o.symtab)
+    for sym=t.offset+24,<t.offset+t.size,24 do
+      local bind=o.data.data[sym+4] >> 4
+      if (bind==1 or bind==2) and symsection(&o,sym)~=0 then
+        result:push(symname(&o,sym))
+      end
+    end
+  end
+  o.sections:destroy()
+end
+
+local function symbol_offset(o: *Object, index: integer, sym: integer): (integer, boolean, boolean)
+  local s = section(o,index)
+  if s.group < 0 then fail('symbol refers to an omitted or empty section') end
+  local values: [2]uint64 <noinit>
+  ## if ccinfo.is_little_endian or ccinfo.is_x86_64 then
+  memory.copy(&values,&o.data.data[sym+8],16)
+  ## else
+  values[0]=word(o.data,sym+8,8); values[1]=word(o.data,sym+16,8)
+  ## end
+  if values[0]>(@uint64)(s.size) or values[1]>(@uint64)(s.size)-values[0] then fail('invalid ELF range') end
+  local off=(@integer)(values[0])
+  return BASE+s.dest+off, s.group == 1 and off < s.size, s.group == 4 or s.group == 5
+end
+
+local function define_symbols(o: *Object)
+  if o.symtab < 0 then return end
+  local t = section(o,o.symtab)
+  for sym = t.offset, < t.offset+t.size, 24 do
+    local bind = o.data.data[sym+4] >> 4
+    local index = symsection(o,sym)
+    if bind > 2 then fail('unsupported symbol binding') end
+    if bind ~= 0 and index ~= 0 then
+      local name = symname(o,sym)
+      if index >= 0xff00 then fail('unsupported special definition ' .. name) end
+      local definition=&definitions[name]
+      if definition.addr~=0 then
+        if bind == 2 then continue end
+        if not definition.weak then fail('duplicate definition of ' .. name) end
+      end
+      local addr, entry_ok, tls = symbol_offset(o,index,sym)
+      $definition = {addr=addr, entry_ok=entry_ok, weak=bind == 2, tls=tls}
+    end
+  end
+end
+
+local function resolve_symbol(o: *Object, t: *Section, index: integer): (integer, boolean)
+  local sym = t.offset + index*24
+  local shndx = symsection(o,sym)
+  local bind = o.data.data[sym+4] >> 4
+  if bind == 0 then
+    if shndx == 0 then fail('undefined local relocation symbol') end
+    local address, _, tls = symbol_offset(o,shndx,sym)
+    return address, tls
+  end
+  local name = symname(o,sym)
+  local found, def = definitions:has_and_get(name)
+  if found then return def.addr, def.tls end
+  if bind == 2 and shndx == 0 then return 0, false end
+  fail('undefined symbol ' .. name)
+  return 0, false
+end
+
+local function put(off: integer, value: uint64, width: integer)
+  ## if ccinfo.is_little_endian or ccinfo.is_x86_64 then
+  memory.copy(&image[off+1],&value,width)
+  ## else
+  for i = 1, width do image[off+i] = (@byte)(value & 255); value = value >> 8 end
+  ## end
+end
+
+-- Allocate GOT slots before image layout. Each external name has one slot
+-- for the static link. Local symbols are keyed by their own input object.
+local function plan_got()
+  local globals: hashmap(string,integer)
+  for i: usize = 1, #objects do
+    local o = &objects[i]
+    context = o.path
+    for j: usize = 1, #o.sections do
+      local r = &o.sections[j]
+      if r.kind ~= 4 or r.size == 0 or section(o,r.info).flags & 2 == 0 then continue end
+      if r.entsize ~= 24 or r.size % 24 ~= 0 or r.link ~= o.symtab then fail('invalid relocation table') end
+      for pos = r.offset, <r.offset+r.size, 24 do
+        local kind = o.data.data[pos+8]
+        if kind ~= 9 and kind ~= 41 and kind ~= 42 then continue end
+        local info = word(o.data,pos+8,8)
+        if (info & 0xffffffff) ~= kind then continue end
+        local index = (@integer)(info >> 32)
+        local t = section(o,r.link)
+        if index <= 0 or index >= t.size // 24 then fail('invalid GOT symbol index') end
+        if o.got[index] ~= 0 then continue end
+        local sym = t.offset + index*24
+        local slot: integer
+        if o.data.data[sym+4] >> 4 == 0 then
+          got_count=got_count+1; slot=got_count
+        else
+          local name = symname(o,sym)
+          slot = globals[name]
+          if slot == 0 then
+            got_count=got_count+1; slot=got_count; globals[name]=slot
+          end
+        end
+        o.got[index]=slot
+      end
+    end
+  end
+  globals:destroy()
+end
+
+local function relocate(o: *Object, r: *Section)
+  local target = section(o,r.info)
+  if target.flags & 2 == 0 or r.size == 0 then return end
+  if r.kind ~= 4 or r.entsize ~= 24 or r.size % 24 ~= 0 or r.link ~= o.symtab then fail('unsupported relocation table') end
+  if target.group < 0 or target.group == 3 or target.group == 5 then fail('relocation has no file-backed target') end
+  local t = section(o,r.link)
+  -- Multiple relocations often refer to the same symbol. Its final address
+  -- is fixed once all objects' strong and weak definitions have been seen.
+  local count=t.size//24
+  if #o.addresses==0 then o.addresses:resize((@usize)(count)) end
+  for pos = r.offset, < r.offset+r.size, 24 do
+    local row: ElfRelocation <noinit>
+    ## if ccinfo.is_little_endian or ccinfo.is_x86_64 then
+    memory.copy(&row,&o.data.data[pos],#ElfRelocation)
+    ## else
+    row.offset=word(o.data,pos,8); row.info=word(o.data,pos+8,8); row.addend=word(o.data,pos+16,8)
+    ## end
+    local info=row.info
+    local kind = (@integer)(info & 0xffffffff)
+    if kind == 0 then continue end
+    local got_relative = kind == 9 or kind == 41 or kind == 42
+    if kind ~= 1 and kind ~= 2 and kind ~= 4 and kind ~= 10 and kind ~= 11 and kind ~= 23 and not got_relative then
+      fail('unsupported x86-64 relocation ' .. tostring(kind))
+    end
+    local width = kind == 1 and 8 or 4
+    if row.offset>(@uint64)(target.size) or target.size-(@integer)(row.offset)<width then fail('invalid ELF range') end
+    local relative=(@integer)(row.offset)
+    local place = target.dest+relative
+    local index = (@integer)(info >> 32)
+    if index <= 0 or index >= count then fail('invalid relocation symbol') end
+    local slot = &o.addresses[index+1]
+    -- Bias by one to cache weak zero. The sign distinguishes TLS offsets.
+    if $slot == 0 then
+      local addr, tls = resolve_symbol(o,t,index)
+      $slot = tls and -(addr+1) or addr+1
+    end
+    local value = $slot-1
+    ## if ccinfo.is_little_endian or ccinfo.is_x86_64 then
+    if kind==1 and not o.in_place_addends and $slot>0 then
+      local field=(@uint64)(value)+row.addend
+      memory.copy(&image[place+1],&field,8)
+      continue
+    end
+    ## end
+    if kind == 23 then
+      if $slot >= 0 then fail('TPOFF32 requires a TLS symbol') end
+      value = (-$slot-1) - thread_pointer
+    elseif $slot < 0 then
+      fail('ordinary relocation against TLS symbol')
+    elseif got_relative then
+      local dest = got_start + (o.got[index]-1)*8
+      put(dest,(@uint64)(value),8)
+      value = BASE+dest
+    end
+    local addend=row.addend
+    if o.in_place_addends then
+      -- The staged TinyCC producer splits addends between RELA and the
+      -- relocated field. Standard ELF RELA uses the explicit addend alone.
+      local extra = word(o.data,target.offset+relative,width)
+      if width == 4 then extra = (@uint64)((@int64)((@int32)(extra))) end
+      addend = addend+extra
+    end
+    if kind == 1 then
+      put(place,(@uint64)(value)+addend,8)
+    else
+      if kind == 2 or kind == 4 or got_relative then value = value - (BASE+place) end
+      local low: integer = kind == 10 and 0 or -2147483648
+      local high: integer = kind == 10 and 4294967295 or 2147483647
+      local signed = (@int64)(addend)
+      if signed < low-value or signed > high-value then fail('relocation does not fit its field') end
+      put(place,(@uint64)(value+signed),4)
+    end
+  end
+end
+
+local function segment_header(h: integer, kind: integer, flags: integer, offset: integer, file_end: integer, mem_end: integer, alignment: integer)
+  put(h,(@uint64)(kind),4); put(h+4,(@uint64)(flags),4); put(h+8,(@uint64)(offset),8)
+  put(h+16,(@uint64)(BASE+offset),8); put(h+24,(@uint64)(BASE+offset),8)
+  put(h+32,(@uint64)(file_end-offset),8); put(h+40,(@uint64)(mem_end-offset),8); put(h+48,(@uint64)(alignment),8)
+end
+
+local function mkstemp(name: *[0]cchar): cint <cimport, cinclude '<stdlib.h>'> end
+local function write(fd: cint, data: pointer, count: csize): clong <cimport, cinclude '<unistd.h>'> end
+local function errno_location(): *cint <cimport 'nelibc_errno_location', cinclude '<errno.h>'> end
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+local function close(fd: cint): cint <cimport, cinclude '<unistd.h>'> end
+local function fchmod(fd: cint, mode: cuint): cint <cimport, cinclude '<sys/stat.h>'> end
+local function umask(mode: cuint): cuint <cimport, cinclude '<sys/stat.h>'> end
+local Stat: type <cimport 'nelinker_stat', cinclude '<sys/stat.h>', nodecl, ctypedef 'stat'> =
+  @record{st_dev: culong, st_ino: culong, st_size: clong, st_mode: cuint}
+local function stat(path: cstring, info: *Stat): cint <cimport, cinclude '<sys/stat.h>'> end
+
+local function save(path: string)
+  local tmpl = path .. '.XXXXXX'
+  local fd = mkstemp((@*[0]cchar)(tmpl.data))
+  if fd < 0 then fail('could not create output') end
+  local n: usize = 0
+  while n < #image do
+    local written = write(fd,&image[n+1],#image-n)
+    if written < 0 and $errno_location() == EINTR then continue end
+    if written <= 0 then break end
+    n = n + (@usize)(written)
+  end
+  local mask = umask(0)
+  umask(mask)
+  local executable = n == #image and fchmod(fd,0x1ff & ~mask) == 0
+  local closed = close(fd) == 0
+  if not executable or not closed or not os.rename(tmpl,path) then
+    os.remove(tmpl); fail('could not install output')
+  end
+end
+
+local function open_read(path: cstring, flags: cint): cint <cimport 'open', cinclude '<fcntl.h>'> end
+local function fstat(fd: cint, info: *Stat): cint <cimport, cinclude '<sys/stat.h>'> end
+local function mmap(addr: pointer, size: csize, prot: cint, flags: cint, fd: cint, off: clong): pointer
+  <cimport, cinclude '<sys/mman.h>'> end
+local MAP_FAILED: pointer <cimport, nodecl, cinclude '<sys/mman.h>'>
+local PROT_READ: cint <cimport, nodecl, cinclude '<sys/mman.h>'>
+local MAP_PRIVATE: cint <cimport, nodecl, cinclude '<sys/mman.h>'>
+
+local Input = @record{
+  path: string, library: boolean, whole: boolean, tcc: boolean, group: boolean, stop: integer,
+  seen: boolean, is_archive: boolean, bytes: string, archive: ar.File
+}
+local inputs: sequence(Input)
+local dirs: sequence(string)
+local forced: sequence(string)
+local output: string
+local entry = '_start'
+local old: Stat
+local existing: boolean
+local function read(fd: cint, buf: pointer, size: csize): clong <cimport,cinclude '<unistd.h>'> end
+local Block = @[65536]byte
+local first_block: Block
+local block: *Block = &first_block
+local used: usize
+
+local function read_some(fd: cint, data: pointer, size: usize): usize
+  local n: clong
+  repeat n=read(fd,data,size) until n>=0 or $errno_location()~=EINTR
+  if n<0 then close(fd); fail('cannot read input') end
+  return (@usize)(n)
+end
+
+local function input_bytes(path: string): string
+  context=path
+  if path==output then fail('output is also an input') end
+  local fd=open_read(path,0)
+  if fd<0 then fail('cannot open input') end
+  local info: Stat
+  if fstat(fd,&info)~=0 then close(fd); fail('cannot stat input') end
+  if existing and old.st_dev==info.st_dev and old.st_ino==info.st_ino then
+    close(fd); fail('output is also an input')
+  end
+  if info.st_mode & 0xf000 == 0x8000 and info.st_size>0 then
+    local size=(@usize)(info.st_size)
+    if size<=16384 then
+      -- Pack small files into retained blocks: one read per object and no
+      -- separate mapping or minor page fault for each input.
+      if size>#Block-used then
+        -- read_some fills every byte exposed to an input view.
+        block=(@*Block)(default_allocator:xalloc(#Block))
+        used=0
+      end
+      local bytes=(@*[0]byte)(&($block)[used])
+      local n: usize=0
+      while n<size do
+        local count=read_some(fd,&bytes[n],size-n)
+        if count==0 then close(fd); fail('input size changed') end
+        n=n+count
+      end
+      used=used+size
+      close(fd)
+      return (@string){data=bytes,size=size}
+    end
+    local address=mmap(nilptr,size,PROT_READ,MAP_PRIVATE,fd,0)
+    if address~=MAP_FAILED then
+      close(fd)
+      return (@string){data=(@*[0]byte)(address),size=size}
+    end
+  end
+  -- Read non-seekable files and failed mappings from the same descriptor.
+  local buffer: stringbuilder
+  repeat
+    local next=buffer:prepare(16384)
+    if next:empty() then close(fd); fail('out of input buffer memory') end
+    local count=read_some(fd,next.data,16384)
+    buffer:commit(count)
+    if count==0 then break end
+  until false
+  close(fd)
+  return buffer:promote()
+end
+
+local function library_path(name: string): string
+  local file = name:subview(1,1)==':' and name:sub(2) or 'lib' .. name .. '.a'
+  local info: Stat
+  for i: usize=1,#dirs do
+    local path=dirs[i] .. '/' .. file
+    if stat(path,&info)==0 then return path end
+  end
+  context=''
+  fail('cannot find -l' .. name)
+  return ''
+end
+
+local function read_input(item: *Input)
+  input_addends = item.tcc
+  if not item.seen then
+    if item.library then item.path=library_path(item.path) end
+    item.bytes=input_bytes(item.path)
+    local magic=item.bytes:subview(1,8)
+    if magic=='!<thin>\n' then fail('thin archives require external member files') end
+    item.is_archive=magic=='!<arch>\n'
+    if item.is_archive then
+      item.archive=ar.open(item.path,item.bytes)
+    else
+      include_object(item.path,item.bytes)
+    end
+    item.seen=true
+  end
+  if item.is_archive then
+    track_objects()
+    ar.search(&item.archive,&symbols,item.whole,include_member,member_exports)
+  end
+end
+
+local function read_range(first: integer, last: integer)
+  local i=first
+  while i<=last do
+    local item=&inputs[i]
+    if item.group then
+      repeat
+        local count=#objects
+        read_range(i+1,item.stop)
+      until #objects==count
+      i=item.stop+1
+    else
+      read_input(item)
+      i=i+1
+    end
+  end
+end
+
+local usage='nelinker -o OUTPUT [-e ENTRY] [-u SYMBOL] [-L DIR] OBJECT|ARCHIVE|-lNAME ...'
+if #arg==1 and arg[1]=='--help' then
+  print(usage)
+  print('  --whole-archive / --no-whole-archive   include every archive member / resume lazy selection')
+  print('  --start-group / --end-group           rescan grouped archives for cyclic dependencies')
+  print('  --tcc-relocs / --elf-relocs           TinyCC in-place addends / standard ELF RELA (default)')
+  print('  -t, --trace                           print selected objects and archive members')
+  os.exit(0)
+end
+local whole: boolean
+local tcc: boolean
+local positional: boolean
+local groups: sequence(integer)
+local pos: usize=1
+while pos<=#arg do
+  local a=arg[pos]
+  if positional or a:subview(1,1)~='-' then
+    inputs:push({path=a,whole=whole,tcc=tcc})
+  elseif a=='--' then positional=true
+  elseif a=='--tcc-relocs' then tcc=true
+  elseif a=='--elf-relocs' then tcc=false
+  elseif a=='--whole-archive' then whole=true
+  elseif a=='--no-whole-archive' then whole=false
+  elseif a=='--start-group' or a=='-(' then
+    inputs:push({group=true}); groups:push((@integer)(#inputs))
+  elseif a=='--end-group' or a=='-)' then
+    if #groups==0 then fail('unmatched --end-group') end
+    inputs[groups:pop()].stop=(@integer)(#inputs)
+  elseif a=='--trace' or a=='-t' then trace=true
+  elseif a=='-static' or a=='-s' then -- the output is always a stripped static executable
+  else
+    local opt=a:subview(1,2)
+    if opt~='-o' and opt~='-e' and opt~='-u' and opt~='-L' and opt~='-l' then fail('unknown option '..a) end
+    local value=a:sub(3)
+    if #value==0 then
+      pos=pos+1
+      if pos>#arg then fail('missing argument to '..opt) end
+      value=arg[pos]
+    end
+    if #value==0 then fail('empty argument to '..opt) end
+    if opt=='-o' then output=value
+    elseif opt=='-e' then entry=value
+    elseif opt=='-u' then forced:push(value)
+    elseif opt=='-L' then dirs:push(value)
+    else inputs:push({path=value,library=true,whole=whole,tcc=tcc}) end
+  end
+  pos=pos+1
+end
+if #output==0 or #inputs==0 then fail('usage: '..usage) end
+if #groups>0 then fail('unmatched --start-group') end
+existing=stat(output,&old)==0
+ar.require_symbol(&symbols,entry)
+for i: usize=1,#forced do ar.require_symbol(&symbols,forced[i]) end
+read_range(1,(@integer)(#inputs))
+context = ''
+if definition_hint>0 then definitions:reserve((@usize)(definition_hint)) end
+plan_got()
+-- Keep actual readonly data on its own non-executable pages. When the only
+-- readonly bytes are ELF headers, map them with text and omit an empty LOAD.
+local separate_ro=readonly_input or got_count>0
+local phnum=2+(separate_ro and 1 or 0)+(writable_input and 1 or 0)+(tls_align>0 and 1 or 0)
+local headers_end=64+phnum*56
+local ro_end=layout(0,headers_end)
+if got_count > 0 then
+  got_start = align_up(ro_end,8)
+  if got_count > (LIMIT-got_start)//8 then fail('GOT exceeds supported image size') end
+  ro_end=got_start+got_count*8
+  definitions['_GLOBAL_OFFSET_TABLE_']={addr=BASE+got_start}
+end
+local rx = separate_ro and align_up(ro_end,PAGE) or 0
+local rx_end = layout(1,separate_ro and rx or headers_end)
+local rw = align_up(rx_end,PAGE)
+local rw_end = layout(2,rw)
+local tls_start = rw_end
+local tls_mem_end = rw_end
+if tls_align > 0 then
+  tls_start = align_up(rw_end,tls_align)
+  rw_end = layout(4,tls_start)
+  tls_mem_end = layout(5,rw_end)
+  -- x86-64 local-exec TLS places its block immediately below the thread pointer.
+  thread_pointer = BASE+tls_start+align_up(tls_mem_end-tls_start,tls_align)
+end
+local mem_end = layout(3,tls_mem_end)
+local has_rw = mem_end ~= rw
+-- A pure BSS load has zero file bytes. Its aligned p_offset may lie
+-- beyond EOF: Linux allocates anonymous zero pages for that segment.
+image:resize((@usize)(rw_end>rw and rw_end or rx_end))
+for i: usize = 1, #objects do
+  local o = &objects[i]
+  context = o.path
+  define_symbols(o)
+  for j: usize = 1, #o.sections do
+    local s = &o.sections[j]
+    if (s.group >= 0 and s.group < 3) or s.group == 4 then memory.copy(&image[s.dest+1],&o.data.data[s.offset],s.size) end
+  end
+end
+for i: usize = 1, #objects do
+  local o = &objects[i]
+  context = o.path
+  for j: usize = 1, #o.sections do
+    local s = &o.sections[j]
+    if s.kind == 4 or s.kind == 9 then relocate(o,s) end
+  end
+end
+context = output
+if not definitions:has(entry) or not definitions[entry].entry_ok then fail('missing executable entry point '..entry) end
+for i: usize=1,#forced do
+  if not definitions:has(forced[i]) then fail('undefined symbol '..forced[i]) end
+end
+local ident = '\x7fELF\x02\x01\x01'
+memory.copy(&image[1],ident.data,#ident)
+put(16,2,2); put(18,62,2); put(20,1,4); put(24,(@uint64)(definitions[entry].addr),8)
+put(32,64,8); put(52,64,2); put(54,56,2); put(56,phnum,2)
+local stack_hdr = 64
+if separate_ro then
+  segment_header(stack_hdr,1,4,0,ro_end,ro_end,PAGE)
+  stack_hdr=stack_hdr+56
+end
+segment_header(stack_hdr,1,5,rx,rx_end,rx_end,PAGE)
+stack_hdr=stack_hdr+56
+if has_rw then
+  segment_header(stack_hdr,1,6,rw,rw_end,mem_end,PAGE)
+  stack_hdr=stack_hdr+56
+end
+if tls_align > 0 then
+  segment_header(stack_hdr,7,4,tls_start,rw_end,tls_mem_end,tls_align)
+  stack_hdr=stack_hdr+56
+end
+put(stack_hdr,0x6474e551,4); put(stack_hdr+4,6,4); put(stack_hdr+48,16,8)
+save(output)
