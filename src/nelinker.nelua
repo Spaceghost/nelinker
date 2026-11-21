@@ -439,7 +439,7 @@ local Stat: type <cimport 'nelinker_stat', cinclude '<sys/stat.h>', nodecl, ctyp
   @record{st_dev: culong, st_ino: culong, st_size: clong, st_mode: cuint}
 local function stat(path: cstring, info: *Stat): cint <cimport, cinclude '<sys/stat.h>'> end
 
-local function save(path: string)
+local function save(path: string, executable: boolean)
   local tmpl = path .. '.XXXXXX'
   local fd = mkstemp((@*[0]cchar)(tmpl.data))
   if fd < 0 then fail('could not create output') end
@@ -452,9 +452,10 @@ local function save(path: string)
   end
   local mask = umask(0)
   umask(mask)
-  local executable = n == #image and fchmod(fd,0x1ff & ~mask) == 0
+  local mode = executable and 0x1ff or 0x1a4
+  local ready = n == #image and fchmod(fd,mode & ~mask) == 0
   local closed = close(fd) == 0
-  if not executable or not closed or not os.rename(tmpl,path) then
+  if not ready or not closed or not os.rename(tmpl,path) then
     os.remove(tmpl); fail('could not install output')
   end
 end
@@ -591,9 +592,181 @@ local function read_range(first: integer, last: integer)
   end
 end
 
+local ArchiveMember = @record{name: string, bytes: string}
+local ArchiveSymbol = @record{name: string, member: integer}
+
+local function archive_field(value: string, width: integer): string
+  if #value > width then fail('archive header field exceeds its width') end
+  local spaces = '                '
+  return value .. spaces:sub(1,width-#value)
+end
+
+local function append_archive(data: string)
+  local offset = (@integer)(#image)
+  image:resize((@usize)(offset+#data))
+  if #data > 0 then memory.copy(&image[offset+1],data.data,#data) end
+end
+
+local function append_archive_word(value: integer)
+  if value < 0 or value > 0xffffffff then fail('archive exceeds GNU index limits') end
+  local offset = (@integer)(#image)
+  image:resize((@usize)(offset+4))
+  image[offset+1] = (@byte)(value >> 24)
+  image[offset+2] = (@byte)(value >> 16)
+  image[offset+3] = (@byte)(value >> 8)
+  image[offset+4] = (@byte)(value)
+end
+
+local function archive_header(name: string, size: integer): string
+  if size < 0 or size > LIMIT then fail('archive member exceeds supported size') end
+  local result = archive_field(name,16) .. archive_field('0',12) ..
+    archive_field('0',6) .. archive_field('0',6) .. archive_field('644',8) ..
+    archive_field(tostring(size),10) .. string.char(96) .. '\n'
+  if #result ~= 60 then fail('invalid archive header') end
+  return result
+end
+
+local function write_archive(members: *sequence(ArchiveMember), symbols: *sequence(ArchiveSymbol))
+  image:resize(0)
+  append_archive('!<arch>\n')
+  if #members == 0 then return end
+
+  if #symbols > (LIMIT-4)//4 then fail('too many symbols for a GNU archive index') end
+  local index_size = 4 + (@integer)(#symbols)*4
+  for i: usize = 1, #symbols do
+    if #symbols[i].name > LIMIT-index_size-1 then fail('GNU archive index exceeds supported size') end
+    index_size = index_size + (@integer)(#symbols[i].name) + 1
+  end
+  local long_names: hashmap(string,integer)
+  local long_table: sequence(byte)
+  for i: usize = 1, #members do
+    local name = members[i].name
+    if name:find('\n',1,true) ~= 0 or name:find('\0',1,true) ~= 0 then
+      fail('archive member name contains a reserved byte')
+    end
+    if #name > 15 or name:find('%s') == 0 then
+      long_names[name] = (@integer)(#long_table)
+      for j: usize = 1, #name do long_table:push(name.data[j-1]) end
+      long_table:push('/'_b)
+      long_table:push('\n'_b)
+      if #long_table > LIMIT then fail('GNU archive name table exceeds supported size') end
+    end
+  end
+
+  local long_table_size = (@integer)(#long_table)
+  local long_table_header = long_table_size > 0 and 60+long_table_size+long_table_size%2 or 0
+  local offsets: sequence(integer)
+  offsets:resize(#members)
+  local cursor = 8 + 60 + index_size + index_size%2 + long_table_header
+  for i: usize = 1, #members do
+    offsets[i] = cursor
+    local size = (@integer)(#members[i].bytes)
+    if cursor > LIMIT-60-size-size%2 then fail('archive exceeds supported size') end
+    cursor = cursor+60+size+size%2
+  end
+  if cursor > LIMIT then fail('archive exceeds supported size') end
+
+  image:reserve((@usize)(cursor))
+  append_archive(archive_header('/',index_size))
+  append_archive_word((@integer)(#symbols))
+  for i: usize = 1, #symbols do append_archive_word(offsets[symbols[i].member]) end
+  for i: usize = 1, #symbols do append_archive(symbols[i].name .. '\0') end
+  if index_size%2 ~= 0 then append_archive('\n') end
+
+  if long_table_size > 0 then
+    append_archive(archive_header('//',long_table_size))
+    append_archive((@string){data=(@*[0]byte)(&long_table[1]),size=(@usize)(long_table_size)})
+    if long_table_size%2 ~= 0 then append_archive('\n') end
+  end
+  for i: usize = 1, #members do
+    local member = &members[i]
+    local name: string
+    local long_offset = long_names[member.name]
+    if long_names:has(member.name) then
+      name = '/' .. tostring(long_offset)
+    else
+      name = member.name .. '/'
+    end
+    append_archive(archive_header(name,(@integer)(#member.bytes)))
+    append_archive(member.bytes)
+    if #member.bytes%2 ~= 0 then append_archive('\n') end
+  end
+  long_names:destroy()
+  long_table:destroy()
+  offsets:destroy()
+end
+
+local function create_archive_command(): boolean
+  if #arg == 0 or arg[1] ~= '--archive' then return false end
+  local archive_output = ''
+  local paths: sequence(string)
+  local pos: usize = 2
+  while pos <= #arg do
+    local value = arg[pos]
+    if value == '-o' then
+      pos = pos+1
+      if pos > #arg or #archive_output > 0 then fail('usage: nelinker --archive -o OUTPUT [OBJECT ...]') end
+      archive_output = arg[pos]
+      if #archive_output == 0 then fail('empty archive output path') end
+    elseif value:subview(1,1) == '-' then
+      fail('unknown archive option ' .. value)
+    else
+      paths:push(value)
+    end
+    pos = pos+1
+  end
+  if #archive_output == 0 then fail('usage: nelinker --archive -o OUTPUT [OBJECT ...]') end
+
+  output = archive_output
+  existing = stat(output,&old) == 0
+  local members: sequence(ArchiveMember)
+  local exports: sequence(ArchiveSymbol)
+  local names: hashmap(string,integer)
+  for i: usize = 1, #paths do
+    local path = paths[i]
+    local base = path
+    for character = 1, #path do
+      if path.data[character-1] == '/'_b then base = path:sub(character+1) end
+    end
+    if #base == 0 then fail(path .. ': archive object path has no filename') end
+    if base == '__.SYMDEF' or base == '__.SYMDEF SORTED' or
+        base == '__.SYMDEF_64' or base == '__.SYMDEF_64 SORTED' then
+      fail('reserved archive member name ' .. base)
+    end
+    if names:has(base) then fail('duplicate archive member name ' .. base) end
+    names[base] = (@integer)(i)
+
+    local bytes = input_bytes(path)
+    local object = parse_object(path,bytes)
+    if object.symtab >= 0 then
+      local table_section = section(&object,object.symtab)
+      for symbol = table_section.offset, < table_section.offset+table_section.size, 24 do
+        local bind = object.data.data[symbol+4] >> 4
+        local index = symsection(&object,symbol)
+        if (bind == 1 or bind == 2) and index ~= 0 then
+          if index == 0xffff then fail('extended ELF symbol indexes are not supported') end
+          local name = symname(&object,symbol)
+          if #name == 0 then fail('empty global symbol name') end
+          exports:push({name=name,member=(@integer)(i)})
+        end
+      end
+    end
+    members:push({name=base,bytes=bytes})
+    object.sections:destroy()
+  end
+
+  context = output
+  write_archive(&members,&exports)
+  save(output,false)
+  return true
+end
+
+if create_archive_command() then os.exit(0) end
+
 local usage='nelinker -o OUTPUT [-e ENTRY] [-u SYMBOL] [-L DIR] OBJECT|ARCHIVE|-lNAME ...'
 if #arg==1 and arg[1]=='--help' then
   print(usage)
+  print('  --archive -o OUTPUT [OBJECT ...]    create a deterministic GNU archive')
   print('  --whole-archive / --no-whole-archive   include every archive member / resume lazy selection')
   print('  --start-group / --end-group           rescan grouped archives for cyclic dependencies')
   print('  --tcc-relocs / --elf-relocs           TinyCC in-place addends / standard ELF RELA (default)')
@@ -720,4 +893,4 @@ if tls_align > 0 then
   stack_hdr=stack_hdr+56
 end
 put(stack_hdr,0x6474e551,4); put(stack_hdr+4,6,4); put(stack_hdr+48,16,8)
-save(output)
+save(output,true)

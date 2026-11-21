@@ -75,6 +75,59 @@ work:
     simple=fn("standalone","work","mov $42,%eax")
     return start,sys,work,mid,base,unused,simple
 
+def check_archive_writer(d, linker, sdk, fixtures):
+    start, _, work, middle, base, unused, simple = fixtures
+    symbols = assemble(d / "symbols.o", ".data\n.weak weak_value\nweak_value: .long 1\n"
+                       ".comm common_value,4,4\n.local private_value\nprivate_value: .long 2")
+    members = [unused, base, middle, work, symbols]
+    archive = d / "created.a"
+    create = [linker, "--archive", "-o", archive]
+    env = {**os.environ, "PATH": "/nonexistent"}
+    invoke([*create, *members], env=env)
+    assert invoke(["ar", "t", archive]).stdout.decode().splitlines() == [p.name for p in members]
+    for member in members:
+        assert invoke(["ar", "p", archive, member.name]).stdout == member.read_bytes()
+    index = invoke(["nm", "-s", archive]).stdout.decode().partition("Archive index:\n")[2].split("\n\n")[0]
+    assert "weak_value in symbols.o" in index and "common_value in symbols.o" in index
+    assert "private_value" not in index and "should_never_be_pulled" not in index
+
+    first = archive.read_bytes()
+    os.utime(work, (1000, 1000))
+    invoke([*create, *members], env=env)
+    assert archive.read_bytes() == first
+    for cmd, name in [([linker], "native"), (["ld", "-m", "elf_x86_64"], "gnu")]:
+        exe = d / ("created-" + name)
+        invoke([*cmd, "-e", "_start", "-o", exe, start, archive])
+        invoke([exe], expect=42)
+
+    invalid = d / "not-an-object"
+    invalid.write_text("ordinary text\n")
+    invoke([*create, simple, invalid], expect=1, env=env)
+    invoke([*create, simple, simple], expect=1, env=env)
+    assert archive.read_bytes() == first
+    alias = d / "input-alias"
+    os.link(simple, alias)
+    original = simple.read_bytes()
+    invoke([linker, "--archive", "-o", alias, simple], expect=1, env=env)
+    assert alias.read_bytes() == simple.read_bytes() == original
+
+    # A shorter rebuild must discard old members, including their symbols.
+    invoke([*create, simple], env=env)
+    assert invoke(["ar", "t", archive]).stdout.decode().splitlines() == [simple.name]
+    exe = d / "created-tcc"
+    invoke([sdk / "tcc/tcc", "-B" + str(sdk / "tcc"), "-nostdlib", "-static",
+            "-Wl,-e,_start", "-o", exe, start, archive])
+    invoke([exe], expect=42)
+    # Separate objects may both define the same symbol. Archive order selects
+    # the first provider during a lazy link.
+    second = assemble(d / "alternate.o", ".text\n.globl work\nwork: mov $17,%eax\n ret")
+    invoke([*create, second, simple], env=env)
+    invoke([linker, "-o", exe, start, archive], env=env)
+    invoke([exe], expect=17)
+    invoke(create, env=env)
+    assert invoke(["ar", "t", archive]).stdout == b""
+    print("Created reproducible indexed archives and linked them with nelinker, GNU ld and TinyCC.")
+
 def main():
     p=argparse.ArgumentParser()
     p.add_argument("linker",type=Path);p.add_argument("sdk",type=Path);p.add_argument("scratch",type=Path)
@@ -92,7 +145,9 @@ def main():
         p=invoke([link,"-o",out,*cmd],expect=1,env=empty_path)
         assert reason in p.stderr.decode(),p.stderr
         assert out.read_bytes()==b"previous valid output"
-    start,sys,work,mid,base,unused,simple=basic_fixtures(d,sdk)
+    fixtures=basic_fixtures(d,sdk)
+    check_archive_writer(d,link,sdk,fixtures)
+    start,sys,work,mid,base,unused,simple=fixtures
     lib=sdk/"libnelibc.a";builtins=sdk/"tcc/libtcc1.a"
     member=invoke(["ar","p",lib,"syscall-asm.o"]).stdout
     (d/"extracted.o").write_bytes(member)

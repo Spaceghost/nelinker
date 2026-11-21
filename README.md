@@ -12,18 +12,24 @@ mkdir -p build
 (cd src && NECC_NELINKER= necc --release nelinker.nelua -o ../build/nelinker)
 ```
 
-## Try an archive
+## Create and link an archive
 
-With GNU binutils installed, build the included example. The link trace should include `build/libanswer.a(answer.o)`. The program exits with status 42.
+Assemble the two example inputs, then use nelinker to create the static library and link its caller. The link trace should include `build/libanswer.a(answer.o)`. The program exits with status 42.
 
 ```sh
 as --64 -o build/start.o examples/start.s
 as --64 -o build/answer.o examples/answer.s
-ar rcs build/libanswer.a build/answer.o
+build/nelinker --archive -o build/libanswer.a build/answer.o
 build/nelinker -t -o build/demo build/start.o build/libanswer.a
 build/demo
 echo "$?"
 ```
+
+Archive mode writes a fresh GNU-format library with a symbol index. Pass every
+object in the desired member order. Repeating the command with the same object
+bytes and member names produces identical archive bytes, even if the input
+timestamps change. Give each member a unique basename. Long names and spaces
+are supported. An empty member list creates an empty archive.
 
 Run the archive and relocation checks with Python 3, GNU binutils, and the same SDK.
 
