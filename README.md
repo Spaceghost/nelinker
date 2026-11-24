@@ -1,6 +1,29 @@
 # nelinker
 
-nelinker is a static ELF linker written in Nelua for x86-64 Linux. It resolves symbols and relocations in ELF objects and Unix archives and writes fixed-address Linux executables or relocatable PE32+ UEFI applications. It supports GNU and BSD archives, archive groups, static GOT entries, and local-exec TLS. PIE, shared libraries, thin archives, LTO, and custom linker scripts are outside its current scope.
+nelinker is a static ELF linker written in Nelua for x86-64 and AArch64 Linux. It resolves symbols and relocations in ELF objects and Unix archives and writes fixed-address Linux executables or x86-64 relocatable PE32+ UEFI applications. It supports GNU and BSD archives, archive groups, static GOT entries, and x86-64 local-exec TLS. PIE, shared libraries, thin archives, LTO, and custom linker scripts are outside its current scope.
+
+## AArch64 static ELF
+
+Build with the Spaceghost Nelua compiler and a Linux C toolchain:
+
+```sh
+mkdir -p build
+nelua -r -D NELINKER_HOSTED=true -L src -o build/nelinker src/nelinker.nelua
+sh tests/check_aarch64.sh build/nelinker
+```
+
+Run the smoke on Linux AArch64, including the
+[Fedora Incus environment](https://nelua.tech/compiler/#linux-arm64).
+It assembles and runs a static executable. The linker can run on either
+Linux host architecture with the hosted build above.
+
+Use `nelinker --aarch64 -o program start.o libprogram.a` for little-endian
+AArch64 ELF objects with standard RELA addends. To create an archive with
+the same object format, use `nelinker --archive --aarch64 -o libprogram.a
+member.o`. The mode supports direct calls and jumps, PC-relative and
+absolute addresses, page-relative instruction pairs and static GOT
+references. AArch64 TLS and PE/EFI output are outside this mode.
+
 
 ## Build
 
