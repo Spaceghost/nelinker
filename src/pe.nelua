@@ -1,4 +1,4 @@
--- PE32+ images for the x86-64 UEFI application loader. Input section
+-- PE32+ images for the UEFI application loader. Input section
 -- destinations are RVAs. File offsets match them until the zero-fill tail.
 require 'algorithm'
 require 'sequence'
@@ -67,7 +67,7 @@ local function section(out: *sequence(byte), pos: integer, name: string, rva: in
 end
 
 function pe.finish(out: *sequence(byte), places: *sequence(integer), base: integer, entry: integer,
-                   ro_end: integer, text: integer, text_end: integer, data: integer,
+                   machine: integer, ro_end: integer, text: integer, text_end: integer, data: integer,
                    data_end: integer, mem_end: integer): string
   local blocks, valid = relocations(places,text)
   if not valid then return 'overlapping PE base relocation fields' end
@@ -87,7 +87,7 @@ function pe.finish(out: *sequence(byte), places: *sequence(integer), base: integ
   local ro_size=aligned(ro_end-PAGE)
   -- Minimal DOS header, PE signature and COFF file header.
   put(out,0,0x5a4d,2); put(out,0x3c,0x80,4); put(out,0x80,0x4550,4)
-  put(out,0x84,0x8664,2); put(out,0x86,count,2); put(out,0x94,240,2)
+  put(out,0x84,machine,2); put(out,0x86,count,2); put(out,0x94,240,2)
   put(out,0x96,0x22,2) -- executable, large-address-aware
   local opt=0x98
   put(out,opt,0x20b,2)

@@ -174,7 +174,7 @@ local function include_object(path: string, bytes: string)
         s.group = s.kind == 1 and 4 or 5 -- .tdata / .tbss
         if tls_align == 0 then tls_align = 16 end -- x86-64 thread control block alignment
         if s.alignment > tls_align then tls_align = s.alignment end
-      elseif aarch64 and s.flags == 3 and (s.kind == 14 or s.kind == 16) then
+      elseif aarch64 and not efi and s.flags == 3 and (s.kind == 14 or s.kind == 16) then
         check_init_array(&o,s,s.kind == 16 and '.preinit_array' or '.init_array')
         s.group = s.kind == 16 and 6 or 7
       else fail('unsupported allocated section type or flags') end
@@ -481,8 +481,14 @@ local function relocate(o: *Object, r: *Section)
       if got_relative then
         if row.addend ~= 0 then fail('AArch64 GOT relocations require a zero addend') end
         local dest = got_start+(o.got[index]-1)*8
+        if efi and value ~= 0 then base_fixups:push(dest) end
         put(dest,(@uint64)(value),8)
         value = image_base+dest
+      elseif efi then
+        if kind == 257 and value ~= 0 then base_fixups:push(place) end
+        if value == 0 and (kind == 261 or kind >= 274 and kind <= 276 or kind == 282 or kind == 283) then
+          fail('PC-relative AArch64 EFI relocation to an undefined weak symbol')
+        end
       end
       relocate_aarch64(kind,place,value,row.addend,word(o.data,target.offset+relative,width))
       continue
@@ -868,11 +874,11 @@ end
 
 if create_archive_command() then os.exit(0) end
 
-local usage='nelinker [--aarch64 | --efi-app] -o OUTPUT [-e ENTRY] [-u SYMBOL] [-L DIR] OBJECT|ARCHIVE|-lNAME ...'
+local usage='nelinker [--aarch64] [--efi-app] -o OUTPUT [-e ENTRY] [-u SYMBOL] [-L DIR] OBJECT|ARCHIVE|-lNAME ...'
 if #arg==1 and arg[1]=='--help' then
   print(usage)
   print('  --aarch64                            link a static AArch64 ELF executable')
-  print('  --efi-app                            write an x86-64 PE32+ EFI application (default entry efi_main)')
+  print('  --efi-app                            write a PE32+ EFI application (default entry efi_main)')
   print('  --image-base ADDRESS                 preferred EFI load address, decimal or hex (default 0x400000)')
   print('  --archive -o OUTPUT [OBJECT ...]    create a deterministic GNU archive')
   print('    give each member a unique basename. Duplicate symbols retain input order.')
@@ -961,8 +967,7 @@ end
 if #output==0 or #inputs==0 then fail('usage: '..usage) end
 if #groups>0 then fail('unmatched --start-group') end
 if explicit_base and not efi then fail('--image-base requires --efi-app') end
-if aarch64 then
-  if efi then fail('AArch64 EFI output is unsupported') end
+if aarch64 and not efi then
   PAGE=65536 -- keep LOAD boundaries suitable for 4, 16 and 64 KiB Linux kernels
 end
 if #entry==0 then entry=efi and 'efi_main' or '_start' end
@@ -1044,7 +1049,7 @@ for i: usize=1,#forced do
   if not definitions:has(forced[i]) then fail('undefined symbol '..forced[i]) end
 end
 if efi then
-  local reason=pe.finish(&image,&base_fixups,image_base,definitions[entry].addr,ro_end,rx,rx_end,rw,rw_end,mem_end)
+  local reason=pe.finish(&image,&base_fixups,image_base,definitions[entry].addr,aarch64 and 0xaa64 or 0x8664,ro_end,rx,rx_end,rw,rw_end,mem_end)
   if #reason>0 then fail(reason) end
   save(output,true)
   os.exit(0)

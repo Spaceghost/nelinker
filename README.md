@@ -1,6 +1,6 @@
 # nelinker
 
-nelinker is a static ELF linker written in Nelua for x86-64 and AArch64 Linux. It resolves symbols and relocations in ELF objects and Unix archives and writes fixed-address Linux executables or x86-64 relocatable PE32+ UEFI applications. It supports GNU and BSD archives, archive groups, static GOT entries, and local-exec TLS. PIE, shared libraries, thin archives, LTO, and custom linker scripts are outside its current scope.
+nelinker is a static ELF linker written in Nelua for x86-64 and AArch64 Linux. It resolves symbols and relocations in ELF objects and Unix archives and writes fixed-address Linux executables or relocatable PE32+ UEFI applications for either architecture. It supports GNU and BSD archives, archive groups, static GOT entries, and local-exec TLS. PIE, shared libraries, thin archives, LTO, and custom linker scripts are outside its current scope.
 
 ## AArch64 static ELF
 
@@ -25,8 +25,7 @@ absolute addresses, page-relative instruction pairs and static GOT
 references. AArch64 local-exec TLS supports the ADD and scaled
 load/store relocations and emits a `PT_TLS` segment. Plain
 `.preinit_array` and `.init_array` sections are linked in input order.
-Priority-suffixed constructor sections and AArch64 PE/EFI output remain
-outside this mode.
+Priority-suffixed constructor sections remain outside the Linux mode.
 
 To relink and run the Nelibc AArch64 startup and worker-thread fixture:
 
@@ -92,6 +91,24 @@ Run the archive and relocation checks with Python 3, GNU binutils, and the same 
 ```sh
 python3 tests/check_archives.py build/nelinker "$NECC_SYSROOT" build
 ```
+
+
+## Link an AArch64 UEFI application
+
+Use freestanding AArch64 ELF objects compiled for the firmware calling
+convention and link with:
+
+```sh
+nelinker --aarch64 --efi-app -o BOOTAA64.EFI menu.o
+```
+
+The linker writes the AArch64 PE32+ EFI machine type and emits DIR64
+rebases for absolute pointers to linked symbols, including static GOT
+entries. The executable entry defaults to `efi_main`. TLS and constructor
+arrays are unsupported in EFI output.
+
+See [Neboot’s Fedora Incus smoke test](https://nelua.tech/neboot/#aarch64)
+for the complete firmware and EFI-stub Linux boot path.
 
 
 ## Link an x86-64 UEFI application
