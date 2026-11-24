@@ -19,7 +19,7 @@ local LIMIT: integer <comptime> = 0x7fffffff
 local Section = @record{
   kind: integer, flags: uint64, offset: integer, size: integer,
   link: integer, info: integer, alignment: integer, entsize: integer,
-  group: integer, dest: integer
+  group: integer, dest: integer, name: uint32
 }
 -- The output is always little-endian. Copy each validated record
 -- into aligned storage once. Archive members can start between aligned words.
@@ -86,7 +86,7 @@ local function parse_object(path: string, data: string): Object
     ## if ccinfo.is_little_endian or ccinfo.is_x86_64 then
     memory.copy(&row,&data.data[h],#ElfSection)
     ## else
-    row.kind=(@uint32)(word(data,h+4,4)); row.flags=word(data,h+8,8)
+    row.name=(@uint32)(word(data,h,4)); row.kind=(@uint32)(word(data,h+4,4)); row.flags=word(data,h+8,8)
     row.offset=word(data,h+24,8); row.size=word(data,h+32,8)
     row.link=(@uint32)(word(data,h+40,4)); row.info=(@uint32)(word(data,h+44,4))
     row.alignment=word(data,h+48,8); row.entsize=word(data,h+56,8)
@@ -96,7 +96,7 @@ local function parse_object(path: string, data: string): Object
     end
     local s: Section = {kind=(@integer)(row.kind),flags=row.flags,offset=(@integer)(row.offset),
       size=(@integer)(row.size),link=(@integer)(row.link),info=(@integer)(row.info),
-      alignment=(@integer)(row.alignment),entsize=(@integer)(row.entsize),group=-1}
+      alignment=(@integer)(row.alignment),entsize=(@integer)(row.entsize),name=row.name,group=-1}
     if s.kind ~= 8 then range((@integer)(#data), s.offset, s.size) end
     if s.kind == 2 then
       if o.symtab >= 0 or s.entsize ~= 24 or s.size % 24 ~= 0 then fail('unsupported ELF symbol table') end
@@ -138,6 +138,15 @@ local function check_usage_note(o: *Object, s: *Section)
     end
   end
 end
+local function check_init_array(o: *Object, s: *Section, expected: string)
+  local strings = section(o,number(o.data,62,2))
+  if strings.kind ~= 3 or s.alignment > 8 or s.size % 8 ~= 0 or s.name >= strings.size then
+    fail('invalid AArch64 constructor array')
+  end
+  local name = o.data:subview(strings.offset+s.name+1,strings.offset+strings.size)
+  if name:subview(1,#expected+1) ~= expected .. '\0' then fail('unsupported AArch64 constructor array name') end
+end
+
 local function include_object(path: string, bytes: string)
   local o = parse_object(path,bytes)
   if aarch64 and input_addends then fail('TinyCC in-place addends are unsupported on AArch64') end
@@ -162,10 +171,12 @@ local function include_object(path: string, bytes: string)
       elseif s.flags == 2 and s.kind == 7 then check_usage_note(&o,s)
       elseif s.flags == 0x403 and (s.kind == 1 or s.kind == 8) then
         if efi then fail('TLS is unsupported in an EFI application') end
-        if aarch64 then fail('TLS relocations are unsupported on AArch64') end
         s.group = s.kind == 1 and 4 or 5 -- .tdata / .tbss
         if tls_align == 0 then tls_align = 16 end -- x86-64 thread control block alignment
         if s.alignment > tls_align then tls_align = s.alignment end
+      elseif aarch64 and s.flags == 3 and (s.kind == 14 or s.kind == 16) then
+        check_init_array(&o,s,s.kind == 16 and '.preinit_array' or '.init_array')
+        s.group = s.kind == 16 and 6 or 7
       else fail('unsupported allocated section type or flags') end
       if s.group==0 then readonly_input=true elseif s.group>=2 then writable_input=true end
     end
@@ -396,6 +407,28 @@ local function relocate_aarch64(kind: integer, place: integer, value: integer, a
   end
 end
 
+local function relocate_aarch64_tls(kind: integer, place: integer, value: integer, addend: uint64, instruction: uint64)
+  if place & 3 ~= 0 then fail('unaligned AArch64 TLS relocation') end
+  local signed = (@int64)(addend)
+  if signed < -value or signed > 0x7fffffffffffffff-value then fail('AArch64 TLS offset out of range') end
+  local offset = (@uint64)(value+signed)
+  local field: uint64
+  if kind == 549 then
+    if offset >= 0x1000000 then fail('AArch64 TLS HI12 out of range') end
+    field = offset >> 12
+  else
+    local shift: integer = 0
+    if kind >= 552 and kind <= 559 then shift=(kind-552)//2
+    elseif kind >= 570 then shift=4 end
+    if (kind == 550 or kind >= 552 and kind%2 == 0) and offset >= 4096 then
+      fail('AArch64 TLS LO12 out of range')
+    end
+    if offset & ((1_u64 << shift)-1) ~= 0 then fail('unaligned AArch64 TLS LO12 relocation') end
+    field = (offset & 4095) >> shift
+  end
+  put(place,(instruction & ~0x003ffc00_u64) | (field << 10),4)
+end
+
 local function relocate(o: *Object, r: *Section)
   local target = section(o,r.info)
   if target.flags & 2 == 0 or r.size == 0 then return end
@@ -437,7 +470,14 @@ local function relocate(o: *Object, r: *Section)
     end
     local value = $slot-1
     if aarch64 then
-      if $slot < 0 then fail('AArch64 TLS relocations are unsupported') end
+      local tls_relative = kind >= 549 and kind <= 559 or kind == 570 or kind == 571
+      if tls_relative then
+        if $slot >= 0 then fail('AArch64 TLS relocation requires a TLS symbol') end
+        relocate_aarch64_tls(kind,place,(-$slot-1)-thread_pointer,row.addend,
+                             word(o.data,target.offset+relative,4))
+        continue
+      end
+      if $slot < 0 then fail('ordinary relocation against AArch64 TLS symbol') end
       if got_relative then
         if row.addend ~= 0 then fail('AArch64 GOT relocations require a zero addend') end
         local dest = got_start+(o.got[index]-1)*8
@@ -949,14 +989,32 @@ local rx = (efi or separate_ro) and align_up(ro_end,PAGE) or 0
 local rx_end = layout(1,(efi or separate_ro) and rx or headers_end)
 local rw = align_up(rx_end,PAGE)
 local rw_end = layout(2,rw)
+local preinit_start = rw_end
+local preinit_end = rw_end
+local init_start = rw_end
+if aarch64 and writable_input then
+  preinit_start = align_up(rw_end,8)
+  preinit_end = layout(6,preinit_start)
+  init_start = preinit_end
+  local init_end = layout(7,init_start)
+  if init_end ~= preinit_start then rw_end=init_end end
+  definitions['__preinit_array_start']={addr=image_base+preinit_start}
+  definitions['__preinit_array_end']={addr=image_base+preinit_end}
+  definitions['__init_array_start']={addr=image_base+init_start}
+  definitions['__init_array_end']={addr=image_base+init_end}
+end
 local tls_start = rw_end
 local tls_mem_end = rw_end
 if tls_align > 0 then
   tls_start = align_up(rw_end,tls_align)
   rw_end = layout(4,tls_start)
   tls_mem_end = layout(5,rw_end)
-  -- x86-64 local-exec TLS places its block immediately below the thread pointer.
-  thread_pointer = image_base+tls_start+align_up(tls_mem_end-tls_start,tls_align)
+  if aarch64 then
+    -- The aligned TLS image follows the 16-byte AArch64 thread control block.
+    thread_pointer = image_base+tls_start-align_up(16,tls_align)
+  else
+    thread_pointer = image_base+tls_start+align_up(tls_mem_end-tls_start,tls_align)
+  end
 end
 local mem_end = layout(3,tls_mem_end)
 local has_rw = mem_end ~= rw
@@ -969,7 +1027,7 @@ for i: usize = 1, #objects do
   define_symbols(o)
   for j: usize = 1, #o.sections do
     local s = &o.sections[j]
-    if (s.group >= 0 and s.group < 3) or s.group == 4 then memory.copy(&image[s.dest+1],&o.data.data[s.offset],s.size) end
+    if (s.group >= 0 and s.group < 3) or s.group == 4 or s.group >= 6 then memory.copy(&image[s.dest+1],&o.data.data[s.offset],s.size) end
   end
 end
 for i: usize = 1, #objects do
